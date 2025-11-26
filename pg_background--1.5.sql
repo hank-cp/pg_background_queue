@@ -35,8 +35,8 @@ CREATE INDEX idx_pg_background_tasks_state
 CREATE INDEX idx_pg_background_tasks_topics 
     ON pg_background_tasks USING GIN(topics);
 
--- Launch a background task (single overloaded function)
-CREATE FUNCTION pg_background_launch(sql pg_catalog.text,
+-- Enqueue a background task (single overloaded function)
+CREATE FUNCTION pg_background_enqueue(sql pg_catalog.text,
 					   topics pg_catalog.text[] DEFAULT NULL)
     RETURNS pg_catalog.int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

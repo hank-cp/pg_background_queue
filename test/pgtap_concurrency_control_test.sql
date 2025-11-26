@@ -18,18 +18,18 @@ SELECT has_column('pg_background_tasks', 'state', 'state column should exist');
 SELECT has_column('pg_background_tasks', 'topics', 'topics column should exist');
 SELECT has_column('pg_background_tasks', 'retry_count', 'retry_count column should exist');
 
-SELECT has_function('pg_background_launch', ARRAY['text', 'text[]'], 'pg_background_launch with topics should exist');
+SELECT has_function('pg_background_enqueue', ARRAY['text', 'text[]'], 'pg_background_enqueue with topics should exist');
 
 CREATE TABLE test_results(value int);
 
 SELECT lives_ok(
-    $$SELECT pg_background_launch('INSERT INTO test_results VALUES (42)'::text, NULL::text[])$$,
-    'launch task without topics should succeed'
+    $$SELECT pg_background_enqueue('INSERT INTO test_results VALUES (42)'::text, NULL::text[])$$,
+    'enqueue task without topics should succeed'
 );
 
 SELECT lives_ok(
-    $$SELECT pg_background_launch('INSERT INTO test_results VALUES (100)'::text, ARRAY['test_topic'])$$,
-    'launch task with topics should succeed'
+    $$SELECT pg_background_enqueue('INSERT INTO test_results VALUES (100)'::text, ARRAY['test_topic'])$$,
+    'enqueue task with topics should succeed'
 );
 
 SELECT is(

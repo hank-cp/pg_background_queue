@@ -11,10 +11,10 @@ ALTER SYSTEM SET log_min_messages = 'info';
 -- Test
 SELECT plan(4);
 
-SELECT has_function('pg_background_launch', ARRAY['text', 'text[]'], 'pg_background_launch function should exist');
+SELECT has_function('pg_background_enqueue', ARRAY['text', 'text[]'], 'pg_background_enqueue function should exist');
 
 CREATE TABLE t(id integer);
-SELECT pg_background_launch('INSERT INTO t SELECT 1');
+SELECT pg_background_enqueue('INSERT INTO t SELECT 1');
 SELECT * FROM pg_background_tasks;
 
 SELECT is(

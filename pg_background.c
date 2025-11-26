@@ -53,12 +53,12 @@ static int	pg_background_delay_in_sec = 0;
 static volatile sig_atomic_t got_sigterm = false;
 
 /* Function declarations */
-PG_FUNCTION_INFO_V1(pg_background_launch);
-PGDLLEXPORT void pg_background_worker_main(Datum);
+PG_FUNCTION_INFO_V1(pg_background_enqueue);
+PGDLLEXPORT void pg_background_worker_loop(Datum);
 
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
-static void process_pending_tasks(void);
+static void launch_background_worker_loop(void);
 static char* extract_first_topic(ArrayType *topics_array);
 static int count_running_tasks_for_topic(const char *topic);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
@@ -107,12 +107,12 @@ _PG_init(void)
 }
 
 /*
- * Launch a background task.
- * Inserts task into queue and triggers processing.
- * Following AGENTS.md flow: Save task → Process pending tasks → End
+ * Enqueue a background task.
+ * Inserts task into queue and triggers worker loop.
+ * Following AGENTS.md flow: Insert task → launch_background_worker_loop() → End
  */
 Datum
-pg_background_launch(PG_FUNCTION_ARGS)
+pg_background_enqueue(PG_FUNCTION_ARGS)
 {
 	text	   *sql;
 	ArrayType  *topics_array = NULL;
@@ -134,12 +134,10 @@ pg_background_launch(PG_FUNCTION_ARGS)
 
 	sql_cstr = text_to_cstring(sql);
 
-	elog(NOTICE, "=== pg_background_launch ENTRY ===");
-
 	if (PG_NARGS() >= 2 && !PG_ARGISNULL(1))
 		topics_array = PG_GETARG_ARRAYTYPE_P(1);
 
-	/* Step 1: Save task to pg_background_tasks */
+	/* Step 1: Insert task to pg_background_tasks */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -175,25 +173,22 @@ pg_background_launch(PG_FUNCTION_ARGS)
 
 	SPI_finish();
 
-	/* Step 2: Process pending tasks */
-	elog(NOTICE, "Before process_pending_tasks");
-	process_pending_tasks();
-	elog(NOTICE, "=== pg_background_launch EXIT ===");
+	/* Step 2: launch_background_worker_loop() */
+	launch_background_worker_loop();
 
 	PG_RETURN_INT64(task_id);
 }
 
 /*
- * Process pending tasks from the queue.
+ * Launch background worker loop.
  * Following AGENTS.md flow:
- *   Pop top 1 task → Check max_parallel_running_tasks_count →
- *   Register worker if allowed → End
+ *   Check max_parallel_running_tasks_count for topic →
+ *   If allowed, register worker for pg_background_worker_loop → End
  */
 static void
-process_pending_tasks(void)
+launch_background_worker_loop(void)
 {
 	int			ret;
-	int64		task_id = 0;
 	ArrayType  *topics_array = NULL;
 	char	   *topic = NULL;
 	int			max_parallel;
@@ -203,58 +198,33 @@ process_pending_tasks(void)
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *worker_handle;
 
-	elog(NOTICE, "process_pending_tasks: START");
-
 	if (SPI_connect() != SPI_OK_CONNECT)
-	{
-		elog(NOTICE, "process_pending_tasks: SPI_connect failed");
 		return;
-	}
 
-	elog(NOTICE, "process_pending_tasks: SPI connected");
-
-	/* Step 1: Pop top 1 task from pending queue */
-	query = "SELECT id, topics FROM pg_background_tasks "
+	/* Step 1: Get first pending task to check topic */
+	query = "SELECT topics FROM pg_background_tasks "
 			"WHERE state IN ('pending', 'retrying') "
 			"AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
-			"ORDER BY joined_at, id LIMIT 1 FOR UPDATE SKIP LOCKED";
+			"ORDER BY joined_at, id LIMIT 1";
 
-	elog(NOTICE, "process_pending_tasks: About to execute query");
 	ret = SPI_execute(query, false, 0);
-	elog(NOTICE, "process_pending_tasks: Query executed, ret=%d, processed=%lu", ret, SPI_processed);
 
 	if (ret != SPI_OK_SELECT || SPI_processed == 0)
 	{
-		elog(NOTICE, "process_pending_tasks: No tasks to process");
 		SPI_finish();
 		return;
 	}
 
-	elog(NOTICE, "process_pending_tasks: Getting task details");
-
-	task_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-										  SPI_tuptable->tupdesc,
-										  1, &isnull));
-
-	elog(NOTICE, "process_pending_tasks: task_id=%ld", (long)task_id);
-
+	Datum topics_datum = SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc,
+									   1, &isnull);
 	if (!isnull)
-	{
-		Datum topics_datum = SPI_getbinval(SPI_tuptable->vals[0],
-										   SPI_tuptable->tupdesc,
-										   2, &isnull);
-		if (!isnull)
-		{
-			topics_array = DatumGetArrayTypePCopy(topics_datum);
-		}
-	}
-
-	elog(NOTICE, "process_pending_tasks: About to extract topic");
+		topics_array = DatumGetArrayTypeP(topics_datum);
+	else
+		topics_array = NULL;
 
 	if (topics_array != NULL)
 		topic = extract_first_topic(topics_array);
-
-	elog(NOTICE, "process_pending_tasks: topic=%s", topic ? topic : "NULL");
 
 	/* Step 2: Check max_parallel_running_tasks_count for topic */
 	max_parallel = (pg_background_max_parallel_running_tasks_count > 0)
@@ -274,8 +244,7 @@ process_pending_tasks(void)
 
 	SPI_finish();
 
-	/* Step 3: Try RegisterDynamicBackgroundWorker */
-	/* Get database and user OIDs */
+	/* Step 3: Register worker for pg_background_worker_loop */
 	Oid db_oid = MyDatabaseId;
 	Oid user_oid = GetUserId();
 
@@ -284,47 +253,25 @@ process_pending_tasks(void)
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_background");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_background_worker_main");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_background task %ld", (long) task_id);
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_background_worker_loop");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_background worker loop");
 #if PG_VERSION_NUM >= 110000
 	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_background");
 #endif
-	worker.bgw_main_arg = Int64GetDatum(task_id);
+	worker.bgw_main_arg = (Datum) 0;
 	worker.bgw_notify_pid = 0;
 
-	/* Store only database_id and user_id as OIDs in bgw_extra (8 bytes total) */
+	/* Store database_id and user_id as OIDs in bgw_extra */
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
 
-	elog(NOTICE, "pg_background: attempting to register worker for task %ld", (long) task_id);
-
 	if (!RegisterDynamicBackgroundWorker(&worker, &worker_handle))
 	{
-		elog(WARNING, "pg_background: failed to register worker for task %ld", (long) task_id);
+		elog(WARNING, "pg_background: failed to register worker loop");
 	}
 	else
 	{
-		BgwHandleStatus status;
-		pid_t		pid;
-
-		elog(NOTICE, "pg_background: successfully registered worker for task %ld", (long) task_id);
-
-		/* Wait for the worker to start */
-		status = WaitForBackgroundWorkerStartup(worker_handle, &pid);
-
-		if (status == BGWH_STARTED)
-		{
-			elog(NOTICE, "pg_background: worker %ld started with PID %d", (long) task_id, (int) pid);
-		}
-		else if (status == BGWH_STOPPED)
-		{
-			elog(WARNING, "pg_background: worker %ld stopped before starting", (long) task_id);
-		}
-		else
-		{
-			elog(WARNING, "pg_background: worker %ld failed to start, status=%d", (long) task_id, status);
-		}
-
+		/* Don't wait for worker to start - let it run asynchronously */
 		pfree(worker_handle);
 	}
 
@@ -333,237 +280,219 @@ process_pending_tasks(void)
 }
 
 /*
- * Background worker main function.
+ * Background worker loop function.
  * Following AGENTS.md flow:
- *   Begin transaction → Mark running → Check delay → pg_sleep →
- *   Execute SQL → Mark finished/failed/retrying → Commit →
- *   Process pending tasks (recursive)
+ *   Loop: Pop task → Begin transaction → Mark running → Check delay →
+ *   pg_sleep → Execute SQL → Mark finished/failed/retrying → Commit →
+ *   Repeat until no tasks
  */
 void
-pg_background_worker_main(Datum main_arg)
+pg_background_worker_loop(Datum main_arg)
 {
-	int64		task_id;
-	int			ret;
-	char	   *sql = NULL;
-	ArrayType  *topics_array = NULL;
-	char	   *topic = NULL;
-	int			retry_count = 0;
-	int			delay_in_sec = 0;
-	int			max_retries;
-	int			retry_delay;
-	bool		isnull;
-	StringInfoData query;
-	ErrorData  *edata;
-	char		error_msg[1024];
 	Oid			database_id;
 	Oid			user_id;
 
-	task_id = DatumGetInt64(main_arg);
-
-	/* Establish signal handlers */
+	/* Establish signal handlers FIRST */
 	pqsignal(SIGTERM, handle_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	elog(NOTICE, "pg_background_worker_main: started for task %ld", (long) task_id);
-
-	/* Set up a memory context and resource owner BEFORE accessing MyBgworkerEntry */
-	Assert(CurrentResourceOwner == NULL);
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_background");
-	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
-												 "pg_background session",
-												 ALLOCSET_DEFAULT_MINSIZE,
-												 ALLOCSET_DEFAULT_INITSIZE,
-												 ALLOCSET_DEFAULT_MAXSIZE);
-
-	/* Extract database_id and user_id from bgw_extra */
+	/* Extract database_id and user_id from bgw_extra BEFORE any setup */
 	memcpy(&database_id, MyBgworkerEntry->bgw_extra, sizeof(Oid));
 	memcpy(&user_id, MyBgworkerEntry->bgw_extra + sizeof(Oid), sizeof(Oid));
 
-	elog(NOTICE, "pg_background_worker_main: database_id=%u, user_id=%u",
+	/* Connect to the database - this sets up memory contexts and resource owners */
+	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
+
+	elog(LOG, "pg_background_worker_loop: started, database_id=%u, user_id=%u",
 		 database_id, user_id);
 
-	/* Connect to the database using OIDs directly */
-	BackgroundWorkerInitializeConnectionByOid(database_id, user_id
-#if PG_VERSION_NUM >= 110000
-										 , 0
-#endif
-	);
-
-	elog(NOTICE, "pg_background_worker_main: connected successfully");
-
-	/* Step 1: Begin transaction & fetch task details */
-	elog(NOTICE, "pg_background_worker_main: about to StartTransactionCommand");
-	StartTransactionCommand();
-	elog(NOTICE, "pg_background_worker_main: about to PushActiveSnapshot");
-	PushActiveSnapshot(GetTransactionSnapshot());
-	elog(NOTICE, "pg_background_worker_main: snapshot pushed");
-
-	if (SPI_connect() != SPI_OK_CONNECT)
+	/* Main loop: process tasks until queue is empty */
+	while (!got_sigterm)
 	{
+		int			ret;
+		int64		task_id = 0;
+		char	   *sql = NULL;
+		ArrayType  *topics_array = NULL;
+		char	   *topic = NULL;
+		int			retry_count = 0;
+		int			delay_in_sec = 0;
+		int			max_retries;
+		int			retry_delay;
+		bool		isnull;
+		StringInfoData query;
+		ErrorData  *edata;
+		char		error_msg[1024];
+
+		elog(LOG, "pg_background_worker_loop: checking for pending tasks");
+
+		/* Step 1: Begin transaction & Pop top 1 task from pending queue */
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+		{
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			break;
+		}
+
+		initStringInfo(&query);
+		appendStringInfoString(&query,
+							   "SELECT id, sql_statement, topics, retry_count "
+							   "FROM pg_background_tasks "
+							   "WHERE state IN ('pending', 'retrying') "
+							   "AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
+							   "ORDER BY joined_at, id LIMIT 1 FOR UPDATE SKIP LOCKED");
+
+		ret = SPI_execute(query.data, false, 0);
+
+		if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		{
+			elog(LOG, "pg_background_worker_loop: no more tasks, exiting");
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			break;
+		}
+
+		/* Extract task details */
+		task_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc,
+											  1, &isnull));
+
+		elog(LOG, "pg_background_worker_loop: processing task %ld", (long) task_id);
+
+		sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc,
+												2, &isnull));
+
+    elog(LOG, "pg_background_worker_loop: executing sql=%s", sql);
+
+		Datum topics_datum = SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc,
+										   3, &isnull);
+		if (!isnull)
+			topics_array = DatumGetArrayTypeP(topics_datum);
+		else
+			topics_array = NULL;
+
+		elog(LOG, "pg_background_worker_loop: topics extracted");
+
+		retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc,
+												  4, &isnull));
+
+		elog(LOG, "pg_background_worker_loop: retry_count=%d", retry_count);
+
+		if (topics_array != NULL)
+			topic = extract_first_topic(topics_array);
+
+		/* Step 2: Mark task state as running */
+		update_task_state_running(task_id);
+
+		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		return;
-	}
 
-  elog(NOTICE, "pg_background_worker_main: SPI connected");
+		/* Step 3: Check delay config by topic & pg_sleep */
+		delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
 
-	initStringInfo(&query);
-	appendStringInfoString(&query,
-						   "SELECT sql_statement, topics, retry_count "
-						   "FROM pg_background_tasks WHERE id = $1");
-
-	{
-		Oid			argtypes[1];
-		Datum		values[1];
-		char		nulls[1];
-
-		argtypes[0] = INT8OID;
-		values[0] = Int64GetDatum(task_id);
-		nulls[0] = ' ';
-
-		ret = SPI_execute_with_args(query.data, 1, argtypes, values, nulls, false, 0);
-	}
-
-	if (ret != SPI_OK_SELECT || SPI_processed != 1)
-	{
-	  elog(NOTICE, "pg_background_worker_main: no pending task, exit");
-		SPI_finish();
-		CommitTransactionCommand();
-		return;
-	}
-
-	elog(NOTICE, "pg_background_worker_main: start processing pending task");
-
-	elog(NOTICE, "pg_background_worker_main: about to get sql_statement");
-	sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
-											SPI_tuptable->tupdesc,
-											1, &isnull));
-	elog(NOTICE, "pg_background_worker_main: sql=%s", sql);
-
-	elog(NOTICE, "pg_background_worker_main: about to get topics");
-	topics_array = DatumGetArrayTypeP(SPI_getbinval(SPI_tuptable->vals[0],
-													SPI_tuptable->tupdesc,
-													2, &isnull));
-	if (isnull)
-		topics_array = NULL;
-	elog(NOTICE, "pg_background_worker_main: topics extracted");
-
-	elog(NOTICE, "pg_background_worker_main: about to get retry_count");
-	retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc,
-											  3, &isnull));
-	elog(NOTICE, "pg_background_worker_main: retry_count=%d", retry_count);
-
-	elog(NOTICE, "pg_background_worker_main: about to extract first topic");
-	if (topics_array != NULL)
-		topic = extract_first_topic(topics_array);
-	elog(NOTICE, "pg_background_worker_main: topic=%s", topic ? topic : "NULL");
-
-	/* Step 2: Mark task state as running */
-	elog(NOTICE, "pg_background_worker_main: about to mark task as running");
-	update_task_state_running(task_id);
-	elog(NOTICE, "pg_background_worker_main: task marked as running");
-
-	elog(NOTICE, "pg_background_worker_main: about to SPI_finish");
-	SPI_finish();
-	elog(NOTICE, "pg_background_worker_main: about to PopActiveSnapshot");
-	PopActiveSnapshot();
-	elog(NOTICE, "pg_background_worker_main: about to CommitTransactionCommand");
-	CommitTransactionCommand();
-	elog(NOTICE, "pg_background_worker_main: transaction committed");
-
-	/* Step 3: Check delay config by topic & pg_sleep */
-	elog(NOTICE, "pg_background_worker_main: about to get delay config");
-	delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
-	elog(NOTICE, "pg_background_worker_main: delay_in_sec=%d", delay_in_sec);
-
-	if (delay_in_sec > 0)
-	{
-		elog(NOTICE, "pg_background_worker_main: sleeping for %d seconds", delay_in_sec);
-		pg_usleep(delay_in_sec * 1000000L);
-	}
-
-	/* Step 4: Execute sql_statement */
-	elog(NOTICE, "pg_background_worker_main: about to execute SQL: %s", sql);
-	SetCurrentStatementStartTimestamp();
-	debug_query_string = sql;
-	pgstat_report_activity(STATE_RUNNING, sql);
-
-	elog(NOTICE, "pg_background_worker_main: about to start transaction for SQL execution");
-	StartTransactionCommand();
-
-#if PG_VERSION_NUM >= 130000
-	if (StatementTimeout > 0)
-		enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
-	else
-		disable_timeout(STATEMENT_TIMEOUT, false);
-#endif
-
-	PG_TRY();
-	{
-		execute_sql_string(sql);
-
-#if PG_VERSION_NUM >= 130000
-		disable_timeout(STATEMENT_TIMEOUT, false);
-#endif
-
-		CommitTransactionCommand();
-
-		/* Step 5: Mark task state as finished */
-		StartTransactionCommand();
-		if (SPI_connect() == SPI_OK_CONNECT)
+		if (delay_in_sec > 0)
 		{
-			update_task_state_finished(task_id);
-			SPI_finish();
+			elog(LOG, "pg_background_worker_loop: sleeping for %d seconds", delay_in_sec);
+			pg_usleep(delay_in_sec * 1000000L);
 		}
-		CommitTransactionCommand();
-	}
-	PG_CATCH();
-	{
+
+		/* Step 4: Execute sql_statement */
+		elog(LOG, "pg_background_worker_loop: executing SQL: %s", sql);
+		SetCurrentStatementStartTimestamp();
+		debug_query_string = sql;
+		pgstat_report_activity(STATE_RUNNING, sql);
+
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
 #if PG_VERSION_NUM >= 130000
-		disable_timeout(STATEMENT_TIMEOUT, false);
+		if (StatementTimeout > 0)
+			enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
+		else
+			disable_timeout(STATEMENT_TIMEOUT, false);
 #endif
 
-		AbortCurrentTransaction();
-
-		edata = CopyErrorData();
-		FlushErrorState();
-
-		snprintf(error_msg, sizeof(error_msg), "%s", edata->message);
-		FreeErrorData(edata);
-
-		/* Step 6: Check retry config & mark retrying/failed */
-		StartTransactionCommand();
-		if (SPI_connect() == SPI_OK_CONNECT)
+		PG_TRY();
 		{
-			max_retries = get_config_for_topic("retry_count", topic, pg_background_retry_count);
+			execute_sql_string(sql);
 
-			if (retry_count < max_retries)
-			{
-				retry_delay = 1 << (retry_count + 1);
-				update_task_state_retrying(task_id, retry_count + 1, retry_delay, error_msg);
-			}
-			else
-			{
-				update_task_state_failed(task_id, error_msg);
-			}
+#if PG_VERSION_NUM >= 130000
+			disable_timeout(STATEMENT_TIMEOUT, false);
+#endif
 
-			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+
+			/* Step 5: Mark task state as finished */
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			if (SPI_connect() == SPI_OK_CONNECT)
+			{
+				update_task_state_finished(task_id);
+				SPI_finish();
+			}
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+
+			elog(LOG, "pg_background_worker_loop: task %ld completed successfully", (long) task_id);
 		}
-		CommitTransactionCommand();
+		PG_CATCH();
+		{
+#if PG_VERSION_NUM >= 130000
+			disable_timeout(STATEMENT_TIMEOUT, false);
+#endif
+
+			AbortCurrentTransaction();
+
+			edata = CopyErrorData();
+			FlushErrorState();
+
+			snprintf(error_msg, sizeof(error_msg), "%s", edata->message);
+			FreeErrorData(edata);
+
+			elog(LOG, "pg_background_worker_loop: task %ld failed: %s", (long) task_id, error_msg);
+
+			/* Step 6: Check retry config & mark retrying/failed */
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			if (SPI_connect() == SPI_OK_CONNECT)
+			{
+				max_retries = get_config_for_topic("retry_count", topic, pg_background_retry_count);
+
+				if (retry_count < max_retries)
+				{
+					retry_delay = 1 << (retry_count + 1);
+					update_task_state_retrying(task_id, retry_count + 1, retry_delay, error_msg);
+					elog(LOG, "pg_background_worker_loop: task %ld will retry (attempt %d/%d)",
+						 (long) task_id, retry_count + 1, max_retries);
+				}
+				else
+				{
+					update_task_state_failed(task_id, error_msg);
+					elog(LOG, "pg_background_worker_loop: task %ld failed permanently", (long) task_id);
+				}
+
+				SPI_finish();
+			}
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+		}
+		PG_END_TRY();
+
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		if (topic != NULL)
+			pfree(topic);
 	}
-	PG_END_TRY();
 
-	pgstat_report_activity(STATE_IDLE, NULL);
-
-	if (topic != NULL)
-		pfree(topic);
-
-	/* Step 7: Process pending tasks (recursive trigger) */
-	StartTransactionCommand();
-	process_pending_tasks();
-	elog(NOTICE, "=== pg_background_launch EXIT ===");
-	CommitTransactionCommand();
+	elog(LOG, "pg_background_worker_loop: exiting");
 }
 
 /*

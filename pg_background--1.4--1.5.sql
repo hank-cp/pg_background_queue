@@ -39,11 +39,12 @@ CREATE INDEX idx_pg_background_tasks_topics
 DROP FUNCTION IF EXISTS pg_background_result(pg_catalog.int4);
 DROP FUNCTION IF EXISTS pg_background_detach(pg_catalog.int4);
 DROP FUNCTION IF EXISTS pg_background_launch(pg_catalog.text, pg_catalog.int4);
+DROP FUNCTION IF EXISTS pg_background_launch(pg_catalog.text, pg_catalog.text[]);
 DROP FUNCTION IF EXISTS grant_pg_background_privileges(pg_catalog.text, boolean);
 DROP FUNCTION IF EXISTS revoke_pg_background_privileges(pg_catalog.text, boolean);
 
 -- Create new simplified API
-CREATE FUNCTION pg_background_launch(sql pg_catalog.text,
+CREATE FUNCTION pg_background_enqueue(sql pg_catalog.text,
 					   topics pg_catalog.text[] DEFAULT NULL)
     RETURNS pg_catalog.int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

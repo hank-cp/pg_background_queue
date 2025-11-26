@@ -16,7 +16,7 @@ CREATE OR REPLACE FUNCTION test_trigger()
 BEGIN
   IF NEW.touch IS NULL THEN
     RAISE NOTICE 'Enter tigger %', NEW.id;
-    SELECT pg_background_launch(format('SELECT test_trigger_func(%s)', NEW.id), 65536, 2);
+    SELECT pg_background_enqueue(format('SELECT test_trigger_func(%s)', NEW.id));
     RAISE NOTICE 'Exit tigger %', NEW.id;
   END IF;
   RETURN NEW;
