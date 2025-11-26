@@ -5,6 +5,6 @@ EXTENSION = pg_background
 DATA = pg_background--1.5.sql pg_background--1.0--1.4.sql pg_background--1.1--1.4.sql pg_background--1.2--1.4.sql pg_background--1.3--1.4.sql pg_background--1.4--1.5.sql
 REGRESS = pg_background
 
-PG_CONFIG = pg_config
+PG_CONFIG = /Applications/Postgres.app/Contents/Versions/16/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

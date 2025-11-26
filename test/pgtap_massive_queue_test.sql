@@ -1,5 +1,6 @@
 -- Clean Up
 DROP EXTENSION IF EXISTS pg_background CASCADE;
+DROP TABLE IF EXISTS pg_background_tasks CASCADE;
 DROP TRIGGER IF EXISTS t_trigger ON t;
 DROP TABLE IF EXISTS t CASCADE;
 DROP FUNCTION IF EXISTS test_trigger CASCADE;
@@ -27,7 +28,7 @@ CREATE OR REPLACE FUNCTION test_trigger_func(t_id integer)
   RETURNS VOID AS $$
 BEGIN
   RAISE NOTICE 'Worker % started.', t_id;
-  PERFORM pg_sleep(2);
+  PERFORM pg_sleep(3);
   UPDATE t SET touch = true WHERE id = t_id;
   RAISE NOTICE 'Worker % finished.', t_id;
 END;
@@ -41,44 +42,42 @@ CREATE TRIGGER t_trigger
 EXECUTE FUNCTION test_trigger();
 
 -- Test
-SELECT plan(4);
+SELECT plan(5);
 
-INSERT INTO t VALUES (generate_series(1, 100));
+INSERT INTO t VALUES (generate_series(1, 20));
 
 SELECT lives_ok(
-  $$SELECT pg_background_enqueue('UPDATE t SET touch = NULL'::text, NULL::text[])$$,
+  $$UPDATE t SET touch = NULL$$,
   'update trigger should fire background tasks'
 );
 -- SELECT * FROM t;
--- SELECT * FROM pg_background_tasks;
+-- SELECT * FROM pg_background_tasks ORDER BY id;
 -- TRUNCATE t;
 -- TRUNCATE pg_background_tasks;
 -- SELECT test_trigger_func(1);
 
+SELECT pg_sleep(1);
+
 SELECT is(
   (SELECT COUNT(*) FROM pg_background_tasks),
-  '100',
+  '20',
   'background tasks should be planned');
 
 SELECT is(
     (SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running'),
-    '8',
-    '8 background tasks should be executed parallel');
+    '4',
+    '4 background tasks should be executed parallel');
 
 SELECT pg_sleep(3);
 
 SELECT is(
     (SELECT COUNT(*) FROM t WHERE touch = TRUE),
-    '8',
-    '8 test table record should be touched');
+    '4',
+    '4 test table record should be touched');
 
 SELECT is(
    (SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'finished'),
-    '8',
-    '8 background tasks should be finished');
+    '4',
+    '4 background tasks should be finished');
 
 SELECT finish();
-
-ALTER SYSTEM RESET logging_collector;
-ALTER SYSTEM RESET log_filename;
-ALTER SYSTEM RESET log_min_messages;

@@ -17,7 +17,7 @@ SELECT has_column('pg_background_tasks', 'sql_statement', 'sql_statement column 
 SELECT has_column('pg_background_tasks', 'state', 'state column should exist');
 SELECT has_column('pg_background_tasks', 'topic', 'topic column should exist');
 SELECT has_column('pg_background_tasks', 'retry_count', 'retry_count column should exist');
-SELECT has_function('pg_background_enqueue', ARRAY['text', 'text[]'], 'pg_background_enqueue function should exist');
+SELECT has_function('pg_background_enqueue', ARRAY['text', 'text'], 'pg_background_enqueue function should exist');
 
 CREATE TABLE t(id integer);
 
@@ -25,12 +25,17 @@ SELECT lives_ok(
          $$SELECT pg_background_enqueue('INSERT INTO t SELECT 1'::text)$$,
          'enqueue task should succeed'
        );
--- SELECT * FROM pg_background_tasks;
+
+-- SELECT pg_background_enqueue('SELECT pg_sleep(60)');
+-- SELECT * FROM pg_background_tasks ORDER BY id;
+-- TRUNCATE pg_background_tasks;
+
+SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
 
 SELECT is(
   (SELECT COUNT(*) FROM pg_background_tasks)::text,
-  '2',
-  'should have 2 tasks in queue'
+  '1',
+  'should have 1 tasks in queue'
 );
 
 SELECT pg_sleep(2);

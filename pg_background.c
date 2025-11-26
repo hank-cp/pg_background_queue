@@ -44,10 +44,10 @@
 PG_MODULE_MAGIC;
 
 /* GUC variables */
-static int	pg_background_reserved_workers = 2;
 static int	pg_background_max_parallel_running_tasks_count = 0;
 static int	pg_background_retry_count = 0;
 static int	pg_background_delay_in_sec = 0;
+static int	pg_background_topic_priority = 100;
 
 /* Signal handling */
 static volatile sig_atomic_t got_sigterm = false;
@@ -59,7 +59,7 @@ PGDLLEXPORT void pg_background_worker_loop(Datum);
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
 static void launch_background_worker_loop(void);
-static int count_running_tasks_for_topic(const char *topic);
+static int count_all_running_tasks(void);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
 static void update_task_state_running(int64 task_id);
 static void update_task_state_finished(int64 task_id);
@@ -72,19 +72,19 @@ static void update_task_state_failed(int64 task_id, const char *error_msg);
 void
 _PG_init(void)
 {
-	DefineCustomIntVariable("pg_background.reserved_workers",
-							"Number of workers to reserve for PostgreSQL.",
-							NULL,
-							&pg_background_reserved_workers,
-							2, 0, INT_MAX,
-							PGC_SIGHUP, 0,
-							NULL, NULL, NULL);
+	const char *guc_value;
+	int			max_worker_processes_value;
+	int			default_max_parallel;
+
+	guc_value = GetConfigOption("max_worker_processes", false, false);
+	max_worker_processes_value = atoi(guc_value);
+	default_max_parallel = max_worker_processes_value / 2;
 
 	DefineCustomIntVariable("pg_background.max_parallel_running_tasks_count",
 							"Maximum parallel running tasks (0 = auto).",
 							NULL,
 							&pg_background_max_parallel_running_tasks_count,
-							0, 0, INT_MAX,
+							default_max_parallel, 0, INT_MAX,
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
@@ -101,6 +101,14 @@ _PG_init(void)
 							NULL,
 							&pg_background_delay_in_sec,
 							0, 0, INT_MAX,
+							PGC_SIGHUP, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_background.topic_priority",
+							"Default priority for topics (lower number = higher priority).",
+							NULL,
+							&pg_background_topic_priority,
+							100, 0, INT_MAX,
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 }
@@ -156,7 +164,7 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 	argtypes[0] = TEXTOID;
 	argtypes[1] = TEXTOID;
 	values[0] = CStringGetTextDatum(sql_cstr);
-	values[1] = CStringGetTextDatum(topic);
+	values[1] = (topic != NULL) ? CStringGetTextDatum(topic) : (Datum) 0;
 	nulls[0] = ' ';
 	nulls[1] = (topic == NULL) ? 'n' : ' ';
 
@@ -193,66 +201,34 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 static void
 launch_background_worker_loop(void)
 {
-	int			ret;
-	char	   *topic = NULL;
-	int			max_parallel;
 	int			running_count;
-	bool		isnull;
-	const char *query;
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *worker_handle;
+	Oid			db_oid;
+	Oid			user_oid;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return;
 
-	/* Step 1: Get first pending task to check topic */
-	query = "SELECT topic FROM pg_background_tasks "
-			"WHERE state IN ('pending', 'retrying') "
-			"AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
-			"ORDER BY joined_at, id LIMIT 1";
+	running_count = count_all_running_tasks();
 
-	ret = SPI_execute(query, false, 0);
-
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	if (running_count >= pg_background_max_parallel_running_tasks_count)
 	{
+		elog(INFO, "launch_background_worker_loop: max parallel limit reached (%d/%d)",
+			 running_count, pg_background_max_parallel_running_tasks_count);
 		SPI_finish();
 		return;
 	}
-
-	Datum topic_datum = SPI_getbinval(SPI_tuptable->vals[0],
-									  SPI_tuptable->tupdesc,
-									  1, &isnull);
-	if (!isnull)
-		topic = TextDatumGetCString(topic_datum);
 	else
-		topic = NULL;
-
-	/* Step 2: Check max_parallel_running_tasks_count for topic */
-	max_parallel = (pg_background_max_parallel_running_tasks_count > 0)
-		? get_config_for_topic("max_parallel_running_tasks_count", topic,
-							   pg_background_max_parallel_running_tasks_count)
-		: (max_worker_processes - pg_background_reserved_workers);
-
-	running_count = count_running_tasks_for_topic(topic);
-
-	if (running_count >= max_parallel)
 	{
-		elog(INFO, "launch_background_worker_loop: max parallel limit reached (%d/%d) for topic '%s'",
-			 running_count, max_parallel, topic ? topic : "default");
-		if (topic != NULL)
-			pfree(topic);
-		SPI_finish();
-		return;
-	} else {
-    elog(INFO, "launch_background_worker_loop: concurrency queue status: (%d/%d) for topic '%s'",
-       running_count, max_parallel, topic ? topic : "default");
+		elog(LOG, "launch_background_worker_loop: concurrency queue status: (%d/%d)",
+			 running_count, pg_background_max_parallel_running_tasks_count);
 	}
 
 	SPI_finish();
 
-	/* Step 3: Register worker for pg_background_worker_loop */
-	Oid db_oid = MyDatabaseId;
-	Oid user_oid = GetUserId();
+	db_oid = MyDatabaseId;
+	user_oid = GetUserId();
 
 	memset(&worker, 0, sizeof(BackgroundWorker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -267,7 +243,6 @@ launch_background_worker_loop(void)
 	worker.bgw_main_arg = (Datum) 0;
 	worker.bgw_notify_pid = 0;
 
-	/* Store database_id and user_id as OIDs in bgw_extra */
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
 
@@ -278,12 +253,8 @@ launch_background_worker_loop(void)
 	else
 	{
 		elog(INFO, "launch_background_worker_loop: worker registered successfully");
-		/* Don't wait for worker to start - let it run asynchronously */
 		pfree(worker_handle);
 	}
-
-	if (topic != NULL)
-		pfree(topic);
 }
 
 /*
@@ -299,21 +270,17 @@ pg_background_worker_loop(Datum main_arg)
 	Oid			database_id;
 	Oid			user_id;
 
-	/* Establish signal handlers FIRST */
 	pqsignal(SIGTERM, handle_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	/* Extract database_id and user_id from bgw_extra BEFORE any setup */
 	memcpy(&database_id, MyBgworkerEntry->bgw_extra, sizeof(Oid));
 	memcpy(&user_id, MyBgworkerEntry->bgw_extra + sizeof(Oid), sizeof(Oid));
 
-	/* Connect to the database - this sets up memory contexts and resource owners */
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
 
 	elog(INFO, "pg_background_worker_loop: started for database %u, user %u",
 		 database_id, user_id);
 
-	/* Main loop: process tasks until queue is empty */
 	while (!got_sigterm)
 	{
 		int			ret;
@@ -328,8 +295,11 @@ pg_background_worker_loop(Datum main_arg)
 		StringInfoData query;
 		ErrorData  *edata;
 		char		error_msg[1024];
+		int			i;
+		int			best_task_idx = -1;
+		int			best_priority = INT_MAX;
+		Datum		topic_datum;
 
-		/* Step 1: Begin transaction & Pop top 1 task from pending queue */
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
@@ -346,7 +316,7 @@ pg_background_worker_loop(Datum main_arg)
 							   "FROM pg_background_tasks "
 							   "WHERE state IN ('pending', 'retrying') "
 							   "AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
-							   "ORDER BY joined_at, id LIMIT 1 FOR UPDATE SKIP LOCKED");
+							   "ORDER BY joined_at, id LIMIT 100 FOR UPDATE SKIP LOCKED");
 
 		ret = SPI_execute(query.data, false, 0);
 
@@ -358,20 +328,51 @@ pg_background_worker_loop(Datum main_arg)
 			break;
 		}
 
-		/* Extract task details */
-		task_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+		for (i = 0; i < SPI_processed; i++)
+		{
+			char *task_topic = NULL;
+			int priority;
+
+			topic_datum = SPI_getbinval(SPI_tuptable->vals[i],
+										SPI_tuptable->tupdesc,
+										3, &isnull);
+			if (!isnull)
+				task_topic = TextDatumGetCString(topic_datum);
+
+			priority = get_config_for_topic("topic_priority", task_topic, pg_background_topic_priority);
+
+			if (priority < best_priority)
+			{
+				best_priority = priority;
+				best_task_idx = i;
+			}
+
+			if (task_topic != NULL)
+				pfree(task_topic);
+		}
+
+		if (best_task_idx == -1)
+		{
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			break;
+		}
+
+		task_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[best_task_idx],
 											  SPI_tuptable->tupdesc,
 											  1, &isnull));
 
-		elog(INFO, "pg_background_worker_loop: processing task %ld", (long) task_id);
+		elog(INFO, "pg_background_worker_loop: processing task %ld with priority %d",
+			 (long) task_id, best_priority);
 
-		sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
+		sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[best_task_idx],
 												SPI_tuptable->tupdesc,
 												2, &isnull));
 
 		elog(LOG, "pg_background_worker_loop: sql=%s", sql);
 
-		Datum topic_datum = SPI_getbinval(SPI_tuptable->vals[0],
+		topic_datum = SPI_getbinval(SPI_tuptable->vals[best_task_idx],
 										  SPI_tuptable->tupdesc,
 										  3, &isnull);
 		if (!isnull)
@@ -381,20 +382,18 @@ pg_background_worker_loop(Datum main_arg)
 
 		elog(LOG, "pg_background_worker_loop: topic=%s", topic ? topic : "NULL");
 
-		retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+		retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[best_task_idx],
 												  SPI_tuptable->tupdesc,
 												  4, &isnull));
 
 		elog(LOG, "pg_background_worker_loop: retry_count=%d", retry_count);
 
-		/* Step 2: Mark task state as running */
 		update_task_state_running(task_id);
 
 		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		/* Step 3: Check delay config by topic & pg_sleep */
 		delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
 
 		if (delay_in_sec > 0)
@@ -403,7 +402,6 @@ pg_background_worker_loop(Datum main_arg)
 			pg_usleep(delay_in_sec * 1000000L);
 		}
 
-		/* Step 4: Execute sql_statement */
 		SetCurrentStatementStartTimestamp();
 		debug_query_string = sql;
 		pgstat_report_activity(STATE_RUNNING, sql);
@@ -429,7 +427,6 @@ pg_background_worker_loop(Datum main_arg)
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 
-			/* Step 5: Mark task state as finished */
 			StartTransactionCommand();
 			PushActiveSnapshot(GetTransactionSnapshot());
 			if (SPI_connect() == SPI_OK_CONNECT)
@@ -458,7 +455,6 @@ pg_background_worker_loop(Datum main_arg)
 
 			elog(INFO, "pg_background_worker_loop: task %ld failed: %s", (long) task_id, error_msg);
 
-			/* Step 6: Check retry config & mark retrying/failed */
 			StartTransactionCommand();
 			PushActiveSnapshot(GetTransactionSnapshot());
 			if (SPI_connect() == SPI_OK_CONNECT)
@@ -498,38 +494,17 @@ pg_background_worker_loop(Datum main_arg)
  * Count running tasks for a specific topic (or all tasks if topic is NULL).
  */
 static int
-count_running_tasks_for_topic(const char *topic)
+count_all_running_tasks(void)
 {
 	int			ret;
 	int			count = 0;
 	bool		count_isnull;
-	StringInfoData query;
+	const char *query;
 
-	initStringInfo(&query);
+	query = "SELECT COUNT(*) FROM pg_background_tasks "
+			"WHERE state = 'running'";
 
-	if (topic == NULL)
-	{
-		appendStringInfoString(&query,
-							   "SELECT COUNT(*) FROM pg_background_tasks "
-							   "WHERE state = 'running'");
-		ret = SPI_execute(query.data, true, 0);
-	}
-	else
-	{
-		Oid			argtypes[1];
-		Datum		values[1];
-		char		nulls[1];
-
-		appendStringInfoString(&query,
-							   "SELECT COUNT(*) FROM pg_background_tasks "
-							   "WHERE state = 'running' AND topic = $1");
-
-		argtypes[0] = TEXTOID;
-		values[0] = CStringGetTextDatum(topic);
-		nulls[0] = ' ';
-
-		ret = SPI_execute_with_args(query.data, 1, argtypes, values, nulls, true, 0);
-	}
+	ret = SPI_execute(query, true, 0);
 
 	if (ret == SPI_OK_SELECT && SPI_processed > 0)
 		count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
