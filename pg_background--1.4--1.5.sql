@@ -14,7 +14,7 @@ CREATE TYPE pg_background_task_state AS ENUM (
 CREATE TABLE pg_background_tasks (
     id BIGSERIAL PRIMARY KEY,
     sql_statement TEXT NOT NULL,
-    topics TEXT[],
+    topic TEXT,
     joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
     started_at TIMESTAMP,
     closed_at TIMESTAMP,
@@ -32,19 +32,20 @@ CREATE INDEX idx_pg_background_tasks_queue
 CREATE INDEX idx_pg_background_tasks_state 
     ON pg_background_tasks(state, closed_at DESC);
 
-CREATE INDEX idx_pg_background_tasks_topics 
-    ON pg_background_tasks USING GIN(topics);
+CREATE INDEX idx_pg_background_tasks_topic 
+    ON pg_background_tasks(topic);
 
 -- Drop old functions
 DROP FUNCTION IF EXISTS pg_background_result(pg_catalog.int4);
 DROP FUNCTION IF EXISTS pg_background_detach(pg_catalog.int4);
 DROP FUNCTION IF EXISTS pg_background_launch(pg_catalog.text, pg_catalog.int4);
 DROP FUNCTION IF EXISTS pg_background_launch(pg_catalog.text, pg_catalog.text[]);
+DROP FUNCTION IF EXISTS pg_background_enqueue(pg_catalog.text, pg_catalog.text[]);
 DROP FUNCTION IF EXISTS grant_pg_background_privileges(pg_catalog.text, boolean);
 DROP FUNCTION IF EXISTS revoke_pg_background_privileges(pg_catalog.text, boolean);
 
 -- Create new simplified API
 CREATE FUNCTION pg_background_enqueue(sql pg_catalog.text,
-					   topics pg_catalog.text[] DEFAULT NULL)
+					   topic pg_catalog.text DEFAULT NULL)
     RETURNS pg_catalog.int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

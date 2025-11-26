@@ -9,14 +9,14 @@ DROP FUNCTION IF EXISTS test_trigger_func CASCADE;
 -- Setup
 CREATE EXTENSION IF NOT EXISTS pg_background;
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SET log_min_messages = NOTICE;
+SET log_min_messages = LOG;
 
 CREATE OR REPLACE FUNCTION test_trigger()
   RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.touch IS NULL THEN
     RAISE NOTICE 'Enter tigger %', NEW.id;
-    SELECT pg_background_enqueue(format('SELECT test_trigger_func(%s)', NEW.id));
+    PERFORM pg_background_enqueue(format('SELECT test_trigger_func(%s)', NEW.id));
     RAISE NOTICE 'Exit tigger %', NEW.id;
   END IF;
   RETURN NEW;
@@ -24,15 +24,16 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION test_trigger_func(t_id integer)
-  RETURNS integer AS $$
+  RETURNS VOID AS $$
 BEGIN
   RAISE NOTICE 'Worker % started.', t_id;
-  SELECT pg_sleep(2);
+  PERFORM pg_sleep(2);
   UPDATE t SET touch = true WHERE id = t_id;
   RAISE NOTICE 'Worker % finished.', t_id;
-  RETURN t_id;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE TABLE t(id integer, touch boolean);
 
 CREATE TRIGGER t_trigger
   AFTER UPDATE ON t
@@ -40,11 +41,19 @@ CREATE TRIGGER t_trigger
 EXECUTE FUNCTION test_trigger();
 
 -- Test
-SELECT plan(2);
+SELECT plan(4);
 
 INSERT INTO t VALUES (generate_series(1, 100));
 
-UPDATE t SET touch = NULL;
+SELECT lives_ok(
+  $$SELECT pg_background_enqueue('UPDATE t SET touch = NULL'::text, NULL::text[])$$,
+  'update trigger should fire background tasks'
+);
+-- SELECT * FROM t;
+-- SELECT * FROM pg_background_tasks;
+-- TRUNCATE t;
+-- TRUNCATE pg_background_tasks;
+-- SELECT test_trigger_func(1);
 
 SELECT is(
   (SELECT COUNT(*) FROM pg_background_tasks),
@@ -69,3 +78,7 @@ SELECT is(
     '8 background tasks should be finished');
 
 SELECT finish();
+
+ALTER SYSTEM RESET logging_collector;
+ALTER SYSTEM RESET log_filename;
+ALTER SYSTEM RESET log_min_messages;

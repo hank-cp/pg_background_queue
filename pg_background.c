@@ -59,7 +59,6 @@ PGDLLEXPORT void pg_background_worker_loop(Datum);
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
 static void launch_background_worker_loop(void);
-static char* extract_first_topic(ArrayType *topics_array);
 static int count_running_tasks_for_topic(const char *topic);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
 static void update_task_state_running(int64 task_id);
@@ -115,8 +114,9 @@ Datum
 pg_background_enqueue(PG_FUNCTION_ARGS)
 {
 	text	   *sql;
-	ArrayType  *topics_array = NULL;
+	text	   *topic_text = NULL;
 	char	   *sql_cstr;
+	char	   *topic = NULL;
 	int64		task_id;
 	int			ret;
 	StringInfoData query;
@@ -135,7 +135,10 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 	sql_cstr = text_to_cstring(sql);
 
 	if (PG_NARGS() >= 2 && !PG_ARGISNULL(1))
-		topics_array = PG_GETARG_ARRAYTYPE_P(1);
+	{
+		topic_text = PG_GETARG_TEXT_PP(1);
+		topic = text_to_cstring(topic_text);
+	}
 
 	/* Step 1: Insert task to pg_background_tasks */
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -146,16 +149,16 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 	initStringInfo(&query);
 	appendStringInfoString(&query,
 						   "INSERT INTO pg_background_tasks "
-						   "(sql_statement, state, retry_count, retry_delay_in_sec, topics) "
+						   "(sql_statement, state, retry_count, retry_delay_in_sec, topic) "
 						   "VALUES ($1, 'pending', 0, 0, $2) "
 						   "RETURNING id");
 
 	argtypes[0] = TEXTOID;
-	argtypes[1] = TEXTARRAYOID;
+	argtypes[1] = TEXTOID;
 	values[0] = CStringGetTextDatum(sql_cstr);
-	values[1] = PointerGetDatum(topics_array);
+	values[1] = CStringGetTextDatum(topic);
 	nulls[0] = ' ';
-	nulls[1] = (topics_array == NULL) ? 'n' : ' ';
+	nulls[1] = (topic == NULL) ? 'n' : ' ';
 
 	ret = SPI_execute_with_args(query.data, 2, argtypes, values, nulls, false, 0);
 
@@ -173,6 +176,8 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 
 	SPI_finish();
 
+	elog(INFO, "pg_background_enqueue: task %ld enqueued", (long) task_id);
+
 	/* Step 2: launch_background_worker_loop() */
 	launch_background_worker_loop();
 
@@ -189,7 +194,6 @@ static void
 launch_background_worker_loop(void)
 {
 	int			ret;
-	ArrayType  *topics_array = NULL;
 	char	   *topic = NULL;
 	int			max_parallel;
 	int			running_count;
@@ -202,7 +206,7 @@ launch_background_worker_loop(void)
 		return;
 
 	/* Step 1: Get first pending task to check topic */
-	query = "SELECT topics FROM pg_background_tasks "
+	query = "SELECT topic FROM pg_background_tasks "
 			"WHERE state IN ('pending', 'retrying') "
 			"AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
 			"ORDER BY joined_at, id LIMIT 1";
@@ -215,16 +219,13 @@ launch_background_worker_loop(void)
 		return;
 	}
 
-	Datum topics_datum = SPI_getbinval(SPI_tuptable->vals[0],
-									   SPI_tuptable->tupdesc,
-									   1, &isnull);
+	Datum topic_datum = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc,
+									  1, &isnull);
 	if (!isnull)
-		topics_array = DatumGetArrayTypeP(topics_datum);
+		topic = TextDatumGetCString(topic_datum);
 	else
-		topics_array = NULL;
-
-	if (topics_array != NULL)
-		topic = extract_first_topic(topics_array);
+		topic = NULL;
 
 	/* Step 2: Check max_parallel_running_tasks_count for topic */
 	max_parallel = (pg_background_max_parallel_running_tasks_count > 0)
@@ -236,10 +237,15 @@ launch_background_worker_loop(void)
 
 	if (running_count >= max_parallel)
 	{
+		elog(INFO, "launch_background_worker_loop: max parallel limit reached (%d/%d) for topic '%s'",
+			 running_count, max_parallel, topic ? topic : "default");
 		if (topic != NULL)
 			pfree(topic);
 		SPI_finish();
 		return;
+	} else {
+    elog(INFO, "launch_background_worker_loop: concurrency queue status: (%d/%d) for topic '%s'",
+       running_count, max_parallel, topic ? topic : "default");
 	}
 
 	SPI_finish();
@@ -267,10 +273,11 @@ launch_background_worker_loop(void)
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &worker_handle))
 	{
-		elog(WARNING, "pg_background: failed to register worker loop");
+		elog(WARNING, "launch_background_worker_loop: failed to register worker");
 	}
 	else
 	{
+		elog(INFO, "launch_background_worker_loop: worker registered successfully");
 		/* Don't wait for worker to start - let it run asynchronously */
 		pfree(worker_handle);
 	}
@@ -303,7 +310,7 @@ pg_background_worker_loop(Datum main_arg)
 	/* Connect to the database - this sets up memory contexts and resource owners */
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
 
-	elog(LOG, "pg_background_worker_loop: started, database_id=%u, user_id=%u",
+	elog(INFO, "pg_background_worker_loop: started for database %u, user %u",
 		 database_id, user_id);
 
 	/* Main loop: process tasks until queue is empty */
@@ -312,7 +319,6 @@ pg_background_worker_loop(Datum main_arg)
 		int			ret;
 		int64		task_id = 0;
 		char	   *sql = NULL;
-		ArrayType  *topics_array = NULL;
 		char	   *topic = NULL;
 		int			retry_count = 0;
 		int			delay_in_sec = 0;
@@ -322,8 +328,6 @@ pg_background_worker_loop(Datum main_arg)
 		StringInfoData query;
 		ErrorData  *edata;
 		char		error_msg[1024];
-
-		elog(LOG, "pg_background_worker_loop: checking for pending tasks");
 
 		/* Step 1: Begin transaction & Pop top 1 task from pending queue */
 		StartTransactionCommand();
@@ -338,7 +342,7 @@ pg_background_worker_loop(Datum main_arg)
 
 		initStringInfo(&query);
 		appendStringInfoString(&query,
-							   "SELECT id, sql_statement, topics, retry_count "
+							   "SELECT id, sql_statement, topic, retry_count "
 							   "FROM pg_background_tasks "
 							   "WHERE state IN ('pending', 'retrying') "
 							   "AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
@@ -348,7 +352,6 @@ pg_background_worker_loop(Datum main_arg)
 
 		if (ret != SPI_OK_SELECT || SPI_processed == 0)
 		{
-			elog(LOG, "pg_background_worker_loop: no more tasks, exiting");
 			SPI_finish();
 			PopActiveSnapshot();
 			CommitTransactionCommand();
@@ -360,32 +363,29 @@ pg_background_worker_loop(Datum main_arg)
 											  SPI_tuptable->tupdesc,
 											  1, &isnull));
 
-		elog(LOG, "pg_background_worker_loop: processing task %ld", (long) task_id);
+		elog(INFO, "pg_background_worker_loop: processing task %ld", (long) task_id);
 
 		sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
 												SPI_tuptable->tupdesc,
 												2, &isnull));
 
-    elog(LOG, "pg_background_worker_loop: executing sql=%s", sql);
+		elog(LOG, "pg_background_worker_loop: sql=%s", sql);
 
-		Datum topics_datum = SPI_getbinval(SPI_tuptable->vals[0],
-										   SPI_tuptable->tupdesc,
-										   3, &isnull);
+		Datum topic_datum = SPI_getbinval(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc,
+										  3, &isnull);
 		if (!isnull)
-			topics_array = DatumGetArrayTypeP(topics_datum);
+			topic = TextDatumGetCString(topic_datum);
 		else
-			topics_array = NULL;
+			topic = NULL;
 
-		elog(LOG, "pg_background_worker_loop: topics extracted");
+		elog(LOG, "pg_background_worker_loop: topic=%s", topic ? topic : "NULL");
 
 		retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
 												  SPI_tuptable->tupdesc,
 												  4, &isnull));
 
 		elog(LOG, "pg_background_worker_loop: retry_count=%d", retry_count);
-
-		if (topics_array != NULL)
-			topic = extract_first_topic(topics_array);
 
 		/* Step 2: Mark task state as running */
 		update_task_state_running(task_id);
@@ -404,7 +404,6 @@ pg_background_worker_loop(Datum main_arg)
 		}
 
 		/* Step 4: Execute sql_statement */
-		elog(LOG, "pg_background_worker_loop: executing SQL: %s", sql);
 		SetCurrentStatementStartTimestamp();
 		debug_query_string = sql;
 		pgstat_report_activity(STATE_RUNNING, sql);
@@ -441,7 +440,7 @@ pg_background_worker_loop(Datum main_arg)
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 
-			elog(LOG, "pg_background_worker_loop: task %ld completed successfully", (long) task_id);
+			elog(INFO, "pg_background_worker_loop: task %ld completed successfully", (long) task_id);
 		}
 		PG_CATCH();
 		{
@@ -457,7 +456,7 @@ pg_background_worker_loop(Datum main_arg)
 			snprintf(error_msg, sizeof(error_msg), "%s", edata->message);
 			FreeErrorData(edata);
 
-			elog(LOG, "pg_background_worker_loop: task %ld failed: %s", (long) task_id, error_msg);
+			elog(INFO, "pg_background_worker_loop: task %ld failed: %s", (long) task_id, error_msg);
 
 			/* Step 6: Check retry config & mark retrying/failed */
 			StartTransactionCommand();
@@ -470,13 +469,13 @@ pg_background_worker_loop(Datum main_arg)
 				{
 					retry_delay = 1 << (retry_count + 1);
 					update_task_state_retrying(task_id, retry_count + 1, retry_delay, error_msg);
-					elog(LOG, "pg_background_worker_loop: task %ld will retry (attempt %d/%d)",
-						 (long) task_id, retry_count + 1, max_retries);
+					elog(INFO, "pg_background_worker_loop: task %ld will retry (attempt %d/%d, delay %ds)",
+						 (long) task_id, retry_count + 1, max_retries, retry_delay);
 				}
 				else
 				{
 					update_task_state_failed(task_id, error_msg);
-					elog(LOG, "pg_background_worker_loop: task %ld failed permanently", (long) task_id);
+					elog(INFO, "pg_background_worker_loop: task %ld marked as failed", (long) task_id);
 				}
 
 				SPI_finish();
@@ -492,7 +491,7 @@ pg_background_worker_loop(Datum main_arg)
 			pfree(topic);
 	}
 
-	elog(LOG, "pg_background_worker_loop: exiting");
+	elog(INFO, "pg_background_worker_loop: exiting");
 }
 
 /*
@@ -523,7 +522,7 @@ count_running_tasks_for_topic(const char *topic)
 
 		appendStringInfoString(&query,
 							   "SELECT COUNT(*) FROM pg_background_tasks "
-							   "WHERE state = 'running' AND $1 = ANY(topics)");
+							   "WHERE state = 'running' AND topic = $1");
 
 		argtypes[0] = TEXTOID;
 		values[0] = CStringGetTextDatum(topic);
@@ -538,46 +537,6 @@ count_running_tasks_for_topic(const char *topic)
 											1, &count_isnull));
 
 	return count;
-}
-
-/*
- * Extract the first topic from a PostgreSQL TEXT[] array.
- */
-static char*
-extract_first_topic(ArrayType *topics_array)
-{
-	Datum		topic_datum;
-	bool		isnull;
-	text	   *topic_text;
-
-	if (topics_array == NULL || ARR_NDIM(topics_array) == 0)
-		return NULL;
-
-	if (ARR_DIMS(topics_array)[0] == 0)
-		return NULL;
-
-	/* Use deconstruct_array to safely extract elements */
-	Datum	   *elems;
-	bool	   *nulls;
-	int			nelems;
-
-	deconstruct_array(topics_array, TEXTOID, -1, false, TYPALIGN_INT,
-					  &elems, &nulls, &nelems);
-
-	if (nelems == 0 || nulls[0])
-	{
-		pfree(elems);
-		pfree(nulls);
-		return NULL;
-	}
-
-	topic_text = DatumGetTextPP(elems[0]);
-	char *result = text_to_cstring(topic_text);
-
-	pfree(elems);
-	pfree(nulls);
-
-	return result;
 }
 
 /*
