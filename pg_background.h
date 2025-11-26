@@ -43,4 +43,10 @@
 	pg_analyze_and_rewrite((parse), (string), (types), (num))
 #endif
 
+#if PG_VERSION_NUM >= 130000
+#define EndCommand_compat(qc, dest, force) EndCommand((qc), (dest), (force))
+#else
+#define EndCommand_compat(qc, dest, force) EndCommand((qc), (dest))
+#endif
+
 #endif			/* PG_BACKGROUND_H_ */

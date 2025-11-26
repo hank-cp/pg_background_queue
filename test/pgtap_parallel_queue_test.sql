@@ -48,12 +48,24 @@ UPDATE t SET touch = NULL;
 
 SELECT is(
   (SELECT COUNT(*) FROM pg_background_tasks),
-  '100'
+  '100',
   'background tasks should be planned');
 
 SELECT is(
     (SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running'),
-    '8'
+    '8',
     '8 background tasks should be executed parallel');
+
+SELECT pg_sleep(3);
+
+SELECT is(
+    (SELECT COUNT(*) FROM t WHERE touch = TRUE),
+    '8',
+    '8 test table record should be touched');
+
+SELECT is(
+   (SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'finished'),
+    '8',
+    '8 background tasks should be finished');
 
 SELECT finish();

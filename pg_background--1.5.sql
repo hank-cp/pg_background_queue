@@ -1,0 +1,42 @@
+
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION pg_background" to load this file. \quit
+
+-- Create the task state enum type
+CREATE TYPE pg_background_task_state AS ENUM (
+    'pending',
+    'running',
+    'retrying',
+    'failed',
+    'finished'
+);
+
+-- Create the tasks management table
+CREATE TABLE pg_background_tasks (
+    id BIGSERIAL PRIMARY KEY,
+    sql_statement TEXT NOT NULL,
+    topics TEXT[],
+    joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMP,
+    closed_at TIMESTAMP,
+    state pg_background_task_state NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    retry_delay_in_sec INTEGER NOT NULL DEFAULT 0,
+    errors TEXT
+);
+
+CREATE INDEX idx_pg_background_tasks_queue 
+    ON pg_background_tasks(joined_at, id) 
+    WHERE state IN ('pending', 'retrying');
+
+CREATE INDEX idx_pg_background_tasks_state 
+    ON pg_background_tasks(state, closed_at DESC);
+
+CREATE INDEX idx_pg_background_tasks_topics 
+    ON pg_background_tasks USING GIN(topics);
+
+-- Launch a background task (single overloaded function)
+CREATE FUNCTION pg_background_launch(sql pg_catalog.text,
+					   topics pg_catalog.text[] DEFAULT NULL)
+    RETURNS pg_catalog.int8
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
