@@ -23,9 +23,12 @@
 #include "miscadmin.h"
 #include "parser/analyze.h"
 #include "pgstat.h"
+#include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/shmem.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -43,6 +46,15 @@
 
 PG_MODULE_MAGIC;
 
+typedef struct PgBackgroundShmemStruct
+{
+	pg_atomic_uint32 active_workers_count;
+} PgBackgroundShmemStruct;
+
+static PgBackgroundShmemStruct *pg_background_shmem = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
 /* GUC variables */
 static int	pg_background_max_parallel_running_tasks_count = 0;
 static int	pg_background_retry_count = 0;
@@ -59,12 +71,15 @@ PGDLLEXPORT void pg_background_worker_loop(Datum);
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
 static void launch_background_worker_loop(void);
-static int count_all_running_tasks(void);
+static uint32 get_active_workers_count(void);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
 static void update_task_state_running(int64 task_id);
 static void update_task_state_finished(int64 task_id);
 static void update_task_state_retrying(int64 task_id, int new_retry_count, int retry_delay, const char *error_msg);
 static void update_task_state_failed(int64 task_id, const char *error_msg);
+static void pg_background_shmem_startup(void);
+static void pg_background_shmem_request(void);
+static void pg_background_worker_cleanup(int code, Datum arg);
 
 /*
  * Module initialization function
@@ -111,6 +126,12 @@ _PG_init(void)
 							100, 0, INT_MAX,
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
+
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pg_background_shmem_request;
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pg_background_shmem_startup;
 }
 
 /*
@@ -201,7 +222,7 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 static void
 launch_background_worker_loop(void)
 {
-	int			running_count;
+	uint32		running_count;
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *worker_handle;
 	Oid			db_oid;
@@ -210,18 +231,18 @@ launch_background_worker_loop(void)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return;
 
-	running_count = count_all_running_tasks();
+	running_count = get_active_workers_count();
 
 	if (running_count >= pg_background_max_parallel_running_tasks_count)
 	{
-		elog(INFO, "launch_background_worker_loop: max parallel limit reached (%d/%d)",
+		elog(INFO, "launch_background_worker_loop: max parallel limit reached (%u/%d)",
 			 running_count, pg_background_max_parallel_running_tasks_count);
 		SPI_finish();
 		return;
 	}
 	else
 	{
-		elog(LOG, "launch_background_worker_loop: concurrency queue status: (%d/%d)",
+		elog(LOG, "launch_background_worker_loop: concurrency queue status: (%u/%d)",
 			 running_count, pg_background_max_parallel_running_tasks_count);
 	}
 
@@ -241,7 +262,7 @@ launch_background_worker_loop(void)
 	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_background");
 #endif
 	worker.bgw_main_arg = (Datum) 0;
-	worker.bgw_notify_pid = 0;
+	worker.bgw_notify_pid = MyProcPid;
 
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
@@ -252,7 +273,28 @@ launch_background_worker_loop(void)
 	}
 	else
 	{
+		BgwHandleStatus status;
+		pid_t pid;
+
 		elog(INFO, "launch_background_worker_loop: worker registered successfully");
+
+		status = WaitForBackgroundWorkerStartup(worker_handle, &pid);
+
+		if (status == BGWH_STARTED)
+		{
+			uint32 count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
+			elog(INFO, "launch_background_worker_loop: worker started with PID %d, active count: %u",
+				 (int)pid, count + 1);
+		}
+		else if (status == BGWH_STOPPED)
+		{
+			elog(WARNING, "launch_background_worker_loop: worker stopped (completed tasks or no tasks available)");
+		}
+		else if (status == BGWH_POSTMASTER_DIED)
+		{
+			elog(ERROR, "launch_background_worker_loop: postmaster died, cannot start worker");
+		}
+
 		pfree(worker_handle);
 	}
 }
@@ -277,6 +319,8 @@ pg_background_worker_loop(Datum main_arg)
 	memcpy(&user_id, MyBgworkerEntry->bgw_extra + sizeof(Oid), sizeof(Oid));
 
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
+
+	before_shmem_exit(pg_background_worker_cleanup, (Datum) 0);
 
 	elog(INFO, "pg_background_worker_loop: started for database %u, user %u",
 		 database_id, user_id);
@@ -490,28 +534,51 @@ pg_background_worker_loop(Datum main_arg)
 	elog(INFO, "pg_background_worker_loop: exiting");
 }
 
-/*
- * Count running tasks for a specific topic (or all tasks if topic is NULL).
- */
-static int
-count_all_running_tasks(void)
+static void
+pg_background_shmem_request(void)
 {
-	int			ret;
-	int			count = 0;
-	bool		count_isnull;
-	const char *query;
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
 
-	query = "SELECT COUNT(*) FROM pg_background_tasks "
-			"WHERE state = 'running'";
+	RequestAddinShmemSpace(sizeof(PgBackgroundShmemStruct));
+}
 
-	ret = SPI_execute(query, true, 0);
+static void
+pg_background_shmem_startup(void)
+{
+	bool found;
 
-	if (ret == SPI_OK_SELECT && SPI_processed > 0)
-		count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											SPI_tuptable->tupdesc,
-											1, &count_isnull));
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
 
-	return count;
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	pg_background_shmem = ShmemInitStruct("pg_background",
+										  sizeof(PgBackgroundShmemStruct),
+										  &found);
+
+	if (!found)
+	{
+		pg_atomic_init_u32(&pg_background_shmem->active_workers_count, 0);
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+static void
+pg_background_worker_cleanup(int code, Datum arg)
+{
+	if (pg_background_shmem != NULL)
+	{
+		uint32 count = pg_atomic_fetch_sub_u32(&pg_background_shmem->active_workers_count, 1);
+		elog(LOG, "pg_background_worker_cleanup: active workers count decremented to %u", count - 1);
+	}
+}
+
+static uint32
+get_active_workers_count(void)
+{
+	return pg_atomic_read_u32(&pg_background_shmem->active_workers_count);
 }
 
 /*

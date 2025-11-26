@@ -7,6 +7,10 @@ CREATE EXTENSION IF NOT EXISTS pg_background;
 CREATE EXTENSION IF NOT EXISTS pgtap;
 SET log_min_messages = NOTICE;
 -- ALTER SYSTEM SET log_min_messages = 'info';
+ALTER SYSTEM RESET logging_collector;
+ALTER SYSTEM RESET log_filename;
+ALTER SYSTEM RESET log_min_messages;
+ALTER SYSTEM RESET pg_background.max_parallel_running_tasks_count;
 
 -- Test
 SELECT plan(11);
@@ -29,6 +33,8 @@ SELECT lives_ok(
 -- SELECT pg_background_enqueue('SELECT pg_sleep(60)');
 -- SELECT * FROM pg_background_tasks ORDER BY id;
 -- TRUNCATE pg_background_tasks;
+SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background';
+SELECT COUNT(*) FROM pg_stat_activity WHERE backend_type = 'pg_background';
 
 SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
 
