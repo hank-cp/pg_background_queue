@@ -389,16 +389,23 @@ pg_background_worker_main(Datum main_arg)
 #endif
 	);
 
+	elog(NOTICE, "pg_background_worker_main: connected successfully");
+
 	/* Step 1: Begin transaction & fetch task details */
+	elog(NOTICE, "pg_background_worker_main: about to StartTransactionCommand");
 	StartTransactionCommand();
+	elog(NOTICE, "pg_background_worker_main: about to PushActiveSnapshot");
+	PushActiveSnapshot(GetTransactionSnapshot());
+	elog(NOTICE, "pg_background_worker_main: snapshot pushed");
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 	{
+		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
 
-  elog(NOTICE, "pg_background_worker_main: database(%s) is connected", get_database_name(database_id));
+  elog(NOTICE, "pg_background_worker_main: SPI connected");
 
 	initStringInfo(&query);
 	appendStringInfoString(&query,
@@ -419,45 +426,70 @@ pg_background_worker_main(Datum main_arg)
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
 	{
+	  elog(NOTICE, "pg_background_worker_main: no pending task, exit");
 		SPI_finish();
 		CommitTransactionCommand();
 		return;
 	}
 
+	elog(NOTICE, "pg_background_worker_main: start processing pending task");
+
+	elog(NOTICE, "pg_background_worker_main: about to get sql_statement");
 	sql = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
 											SPI_tuptable->tupdesc,
 											1, &isnull));
+	elog(NOTICE, "pg_background_worker_main: sql=%s", sql);
 
+	elog(NOTICE, "pg_background_worker_main: about to get topics");
 	topics_array = DatumGetArrayTypeP(SPI_getbinval(SPI_tuptable->vals[0],
 													SPI_tuptable->tupdesc,
 													2, &isnull));
 	if (isnull)
 		topics_array = NULL;
+	elog(NOTICE, "pg_background_worker_main: topics extracted");
 
+	elog(NOTICE, "pg_background_worker_main: about to get retry_count");
 	retry_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
 											  SPI_tuptable->tupdesc,
 											  3, &isnull));
+	elog(NOTICE, "pg_background_worker_main: retry_count=%d", retry_count);
 
+	elog(NOTICE, "pg_background_worker_main: about to extract first topic");
 	if (topics_array != NULL)
 		topic = extract_first_topic(topics_array);
+	elog(NOTICE, "pg_background_worker_main: topic=%s", topic ? topic : "NULL");
 
 	/* Step 2: Mark task state as running */
+	elog(NOTICE, "pg_background_worker_main: about to mark task as running");
 	update_task_state_running(task_id);
+	elog(NOTICE, "pg_background_worker_main: task marked as running");
 
+	elog(NOTICE, "pg_background_worker_main: about to SPI_finish");
 	SPI_finish();
+	elog(NOTICE, "pg_background_worker_main: about to PopActiveSnapshot");
+	PopActiveSnapshot();
+	elog(NOTICE, "pg_background_worker_main: about to CommitTransactionCommand");
 	CommitTransactionCommand();
+	elog(NOTICE, "pg_background_worker_main: transaction committed");
 
 	/* Step 3: Check delay config by topic & pg_sleep */
+	elog(NOTICE, "pg_background_worker_main: about to get delay config");
 	delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
+	elog(NOTICE, "pg_background_worker_main: delay_in_sec=%d", delay_in_sec);
 
 	if (delay_in_sec > 0)
+	{
+		elog(NOTICE, "pg_background_worker_main: sleeping for %d seconds", delay_in_sec);
 		pg_usleep(delay_in_sec * 1000000L);
+	}
 
 	/* Step 4: Execute sql_statement */
+	elog(NOTICE, "pg_background_worker_main: about to execute SQL: %s", sql);
 	SetCurrentStatementStartTimestamp();
 	debug_query_string = sql;
 	pgstat_report_activity(STATE_RUNNING, sql);
 
+	elog(NOTICE, "pg_background_worker_main: about to start transaction for SQL execution");
 	StartTransactionCommand();
 
 #if PG_VERSION_NUM >= 130000

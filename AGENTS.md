@@ -11,6 +11,9 @@ make clean && make
 
 # Install to PostgreSQL
 make install
+
+# After modifying code, rebuild and reinstall, then restart Postgres to reload library
+make clean && make install && pg_ctl restart -D /Users/hank/Library/Application\ Support/Postgres/var-16
 ```
 
 ### Testing
@@ -81,44 +84,46 @@ ALTER EXTENSION pg_background UPDATE TO '1.5';
 3. Once `pg_background_launch` is fired, follow this flow:
 ```mermaid
 ---
-title: pg_background_launch()
+title: pg_background_enqueue() (entrance API)
 ---
 flowchart TB
-  A[Save task to `pg_background_tasks`] --> B[Process pending tasks] --> ed[End]
+  A[Insert task to `pg_background_tasks`] --> B["launch_background_worker_loop()"] --> ed[End]
 ```
 ```mermaid
 ---
-title: Process pending tasks
+title: launch_background_worker_loop()
 ---
 flowchart TB
-S1[Pop top 1 task from pending queue] --> S3[check max_parallel_running_tasks_count for topic] 
-S3 --running count < config count--> S2[try `RegisterDynamicBackgroundWorker`]
-S3 --running count >= config count--> ed[End]
-S2 --o W[Execute background worker]
+S1[check max_parallel_running_tasks_count for topic] 
+S1 --running count < config count--> S2[try `RegisterDynamicBackgroundWorker` to invoice `pg_background_worker_loop`]
+S1 --running count >= config count--> ed[End]
 S2 --> ed[End]
 ```
 ```mermaid
 ---
-title: Execute background worker
+title: pg_background_worker_loop()
 ---
 flowchart TB
-W0[begin transaction] --> W1[mark task state as `running`]
-W1 --> W2[check delay config by topic]
+W11["Pop top 1 task from pending queue"] -- no task --> ed["End"]
+W11 -- has pending task --> W0["begin transaction"]
+W1["mark task state as `running`"] --> W2["check delay config by topic"]
 W2 --> W3["pg_sleep(delay_in_sec)"]
-W3 --> W4[execute sql_statement]
-W4 --success--> W5[mark task state as finished] 
-W5 --> W10[commit transaction]
-W4 --failed--> W6[check retry config by topic]
-W6 --retry_count < retry_config--> W7["retry_count += 1; retry_delay_in_sec = power(2, retry_count)"]
-W7 --> W8[mark task state as `retrying`]
+W3 --> W4["execute sql_statement"]
+W4 -- success --> W5["mark task state as finished"]
+W5 --> W10["commit transaction"]
+W4 -- failed --> W6["check retry config by topic"]
+W6 -- retry_count &lt; retry_config --> W7["retry_count += 1; retry_delay_in_sec = power(2, retry_count)"]
+W7 --> W8["mark task state as `retrying`"]
 W8 --> W10
-W6 --retry_count >= retry_config--> W9[mark task state as `failed`]
+W6 -- "retry_count >= retry_config" --> W9["mark task state as `failed`"]
 W9 --> W10
-W10 --> S[Process pending tasks]
-S[Process pending tasks] --> ed
+W0 --> W1
+W10 --> W11
 ```
 
-4. Configuration:
+4. User `pg_cron` to schedule `launch_background_worker_loop()` once per minute
+
+5. Configuration:
   - `pg_background.retry_count`: failed task auto retry count, default 0
     - `pg_background.retry_count.topic`: overrides global `retry_count` config for specific topic
   - `pg_background.max_parallel_running_tasks_count`: max parallel running tasks count, default to `max_worker_processes`
@@ -126,7 +131,7 @@ S[Process pending tasks] --> ed
   - `pg_background.delay_in_sec`: delay between each task in pending queue, default 0
     - `pg_background.delay_in_sec.topic`: overrides global `delay_in_sec` config for specific topic
 
-5. SQL function changes:
+6. SQL function changes:
   - Modify `pg_background_launch()`: add `topics` parameter
 
 ### Test
