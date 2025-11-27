@@ -66,12 +66,15 @@ static volatile sig_atomic_t got_sigterm = false;
 
 /* Function declarations */
 PG_FUNCTION_INFO_V1(pg_background_enqueue);
+PG_FUNCTION_INFO_V1(pg_background_ensure_workers);
+PG_FUNCTION_INFO_V1(pg_background_active_workers_count);
+PG_FUNCTION_INFO_V1(pg_background_calibrate_workers_count);
 PGDLLEXPORT void pg_background_worker_loop(Datum);
 
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
 static void launch_background_worker(void);
-static uint32 get_active_workers_count(void);
+static inline uint32 get_active_workers_count(void);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
 static void update_task_state_running(int64 task_id);
 static void update_task_state_finished(int64 task_id);
@@ -219,6 +222,68 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Ensure workers are running to process pending tasks.
+ * This function is called by pg_cron to periodically check for pending tasks.
+ * It launches a worker if there are pending tasks and worker slots available.
+ */
+Datum
+pg_background_ensure_workers(PG_FUNCTION_ARGS)
+{
+	uint32		running_count;
+	int			pending_count;
+	int			ret;
+	bool		isnull;
+
+	/* Check if there are pending or retrying tasks */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not connect to SPI manager")));
+
+	ret = SPI_execute("SELECT COUNT(*) FROM pg_background_tasks "
+					  "WHERE state IN ('pending', 'retrying')",
+					  true, 0);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to query pending tasks")));
+	}
+
+	pending_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc,
+												 1, &isnull));
+
+	SPI_finish();
+
+	/* If no pending tasks, nothing to do */
+	if (pending_count == 0)
+	{
+		elog(DEBUG1, "pg_background_ensure_workers: no pending tasks");
+		PG_RETURN_VOID();
+	}
+
+	/* Check if we have available worker slots */
+	running_count = get_active_workers_count();
+
+	if (running_count < pg_background_max_parallel_running_tasks_count)
+	{
+		elog(LOG, "pg_background_ensure_workers: launching worker, pending tasks: %d, running workers: %u/%d",
+			 pending_count, running_count, pg_background_max_parallel_running_tasks_count);
+		launch_background_worker();
+	}
+	else
+	{
+		elog(DEBUG1, "pg_background_ensure_workers: max parallel limit reached (%u/%d), pending tasks: %d",
+			 running_count, pg_background_max_parallel_running_tasks_count, pending_count);
+	}
+
+	PG_RETURN_VOID();
+}
+
+/*
  * Launch background worker loop.
  * Following AGENTS.md flow:
  *   Check max_parallel_running_tasks_count for topic →
@@ -267,7 +332,6 @@ launch_background_worker(void)
 	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_background");
 #endif
 	worker.bgw_main_arg = (Datum) 0;
-	worker.bgw_notify_pid = MyProcPid;
 
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
@@ -276,32 +340,13 @@ launch_background_worker(void)
 	{
 		elog(WARNING, "QUEUE_CONTROL: Bad happened!! cannot register background process. "
 		  "`active_workers_count` is not counted correctly, "
-		  "or maybe `pg_background.max_parallel_running_tasks_count` is larger than `max_worker_processes`.");
+		  "or maybe `pg_background.max_parallel_running_tasks_count` is larger than `max_worker_processes`."
+		  "Try increase `max_worker_processes` to fix me.");
 	}
 	else
 	{
-		BgwHandleStatus status;
-		pid_t pid;
-
-		elog(INFO, "QUEUE_CONTROL: worker registered successfully");
-
-		status = WaitForBackgroundWorkerStartup(worker_handle, &pid);
-
-		if (status == BGWH_STARTED)
-		{
-			uint32 count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
-			elog(LOG, "QUEUE_CONTROL: worker started with PID %d, active count: %u",
-				 (int)pid, count + 1);
-		}
-		else if (status == BGWH_STOPPED)
-		{
-			elog(WARNING, "QUEUE_CONTROL: worker stopped (completed tasks or no tasks available)");
-		}
-		else if (status == BGWH_POSTMASTER_DIED)
-		{
-			elog(ERROR, "launch_background_worker: postmaster died, cannot start worker");
-		}
-
+	  uint32 count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
+		elog(INFO, "QUEUE_CONTROL: worker registered successfully, active count: %u", count + 1);
 		pfree(worker_handle);
 	}
 }
@@ -335,8 +380,8 @@ pg_background_worker_loop(Datum main_arg)
 	/* Connect to the database - this sets up memory contexts and resource owners */
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
 
-	elog(INFO, "PG_BACKGROUND_WORKER: started for database %u, user %u",
-		 database_id, user_id);
+	elog(INFO, "PG_BACKGROUND_WORKER: started (PID=%d) for database %u, user %u",
+	    MyProcPid, database_id, user_id);
 
 	/* Main loop: process tasks until queue is empty */
 	while (!got_sigterm)
@@ -562,10 +607,89 @@ pg_background_worker_cleanup(int code, Datum arg)
 	}
 }
 
-static uint32
+/*
+ * Internal helper function to get current active workers count.
+ */
+static inline uint32
 get_active_workers_count(void)
 {
+	if (pg_background_shmem == NULL)
+		return 0;
 	return pg_atomic_read_u32(&pg_background_shmem->active_workers_count);
+}
+
+/*
+ * SQL-callable function to get current active workers count.
+ */
+Datum
+pg_background_active_workers_count(PG_FUNCTION_ARGS)
+{
+	uint32		count;
+
+	if (pg_background_shmem == NULL)
+		PG_RETURN_INT32(0);
+
+	count = get_active_workers_count();
+
+	PG_RETURN_INT32((int32) count);
+}
+
+/*
+ * Calibrate active workers count by querying pg_stat_activity.
+ * This function fixes any discrepancies between the shared memory counter
+ * and the actual number of running pg_background workers.
+ */
+Datum
+pg_background_calibrate_workers_count(PG_FUNCTION_ARGS)
+{
+	int			ret;
+	int			actual_count;
+	uint32		old_count;
+	bool		isnull;
+
+	/* Query the actual number of pg_background workers from pg_stat_activity */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not connect to SPI manager")));
+
+	ret = SPI_execute("SELECT COUNT(*) FROM pg_stat_activity "
+					  "WHERE backend_type = 'pg_background'",
+					  true, 0);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to query pg_stat_activity")));
+	}
+
+	actual_count = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc,
+												1, &isnull));
+
+	SPI_finish();
+
+	if (pg_background_shmem == NULL)
+		PG_RETURN_INT32(0);
+
+	/* Get old count and set new count atomically */
+	old_count = pg_atomic_read_u32(&pg_background_shmem->active_workers_count);
+	pg_atomic_write_u32(&pg_background_shmem->active_workers_count, (uint32) actual_count);
+
+	if (old_count != (uint32) actual_count)
+	{
+		elog(LOG, "pg_background_calibrate_workers_count: calibrated counter from %u to %d",
+			 old_count, actual_count);
+	}
+	else
+	{
+		elog(DEBUG1, "pg_background_calibrate_workers_count: counter already accurate at %u",
+			 old_count);
+	}
+
+	PG_RETURN_INT32(actual_count);
 }
 
 /*

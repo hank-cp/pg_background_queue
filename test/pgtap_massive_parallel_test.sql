@@ -28,7 +28,7 @@ CREATE OR REPLACE FUNCTION test_trigger_func(t_id integer)
   RETURNS VOID AS $$
 BEGIN
   RAISE NOTICE 'Worker % started.', t_id;
-  PERFORM pg_sleep(3);
+  PERFORM pg_sleep(2);
   UPDATE t SET touch = true WHERE id = t_id;
   RAISE NOTICE 'Worker % finished.', t_id;
 END;
@@ -42,28 +42,37 @@ CREATE TRIGGER t_trigger
 EXECUTE FUNCTION test_trigger();
 
 -- Test
-SELECT plan(5);
+SELECT plan(6);
 
-INSERT INTO t VALUES (generate_series(1, 100));
+INSERT INTO t VALUES (generate_series(1, 30));
 
 SELECT lives_ok(
   $$UPDATE t SET touch = NULL$$,
   'update trigger should fire background tasks'
 );
+
+-- DEBUG QUERIES
 -- SELECT * FROM t;
 -- SELECT * FROM pg_background_tasks ORDER BY id;
 -- TRUNCATE t;
 -- TRUNCATE pg_background_tasks;
 -- SELECT test_trigger_func(1);
-SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
-SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background';
+-- SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
+-- SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background';
+-- SELECT * FROM pg_stat_activity WHERE client_port IS NULL AND usesysid IS NOT NULL;
 
 SELECT pg_sleep(1);
 
 SELECT is(
   (SELECT COUNT(*) FROM pg_background_tasks),
-  '20',
+  '30',
   'background tasks should be planned');
+
+SELECT is(
+  (SELECT pg_background_active_workers_count()),
+  '4',
+  'should have no active background worker now.'
+);
 
 SELECT is(
     (SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running'),

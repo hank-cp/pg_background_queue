@@ -41,3 +41,23 @@ CREATE FUNCTION pg_background_enqueue(sql pg_catalog.text,
 					   topic pg_catalog.text DEFAULT NULL)
     RETURNS pg_catalog.int8
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Function to ensure workers are running (called by pg_cron)
+CREATE FUNCTION pg_background_ensure_workers()
+    RETURNS void
+    AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Get current active workers count
+CREATE FUNCTION pg_background_active_workers_count()
+    RETURNS integer
+    AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Calibrate active workers count by querying actual processes
+CREATE FUNCTION pg_background_calibrate_workers_count()
+    RETURNS integer
+    AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- Schedule using pg_cron (requires pg_cron extension)
+-- SELECT cron.schedule('pg_background_ensure_workers', '* * * * *', 'SELECT pg_background_ensure_workers();');
+-- Optional: Schedule periodic calibration using pg_cron
+-- SELECT cron.schedule('pg_background_calibrate', '*/5 * * * *', 'SELECT pg_background_calibrate_workers_count();');
