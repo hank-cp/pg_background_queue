@@ -44,7 +44,7 @@ EXECUTE FUNCTION test_trigger();
 -- Test
 SELECT plan(5);
 
-INSERT INTO t VALUES (generate_series(1, 20));
+INSERT INTO t VALUES (generate_series(1, 100));
 
 SELECT lives_ok(
   $$UPDATE t SET touch = NULL$$,
@@ -55,6 +55,8 @@ SELECT lives_ok(
 -- TRUNCATE t;
 -- TRUNCATE pg_background_tasks;
 -- SELECT test_trigger_func(1);
+SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
+SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background';
 
 SELECT pg_sleep(1);
 

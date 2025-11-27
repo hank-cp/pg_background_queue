@@ -19,20 +19,21 @@ CREATE TABLE pg_background_tasks (
     joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
     started_at TIMESTAMP,
     closed_at TIMESTAMP,
+    priority INTEGER NOT NULL DEFAULT 0,
     state pg_background_task_state NOT NULL DEFAULT 'pending',
     retry_count INTEGER NOT NULL DEFAULT 0,
     retry_delay_in_sec INTEGER NOT NULL DEFAULT 0,
     errors TEXT
 );
 
-CREATE INDEX idx_pg_background_tasks_queue 
-    ON pg_background_tasks(joined_at, id) 
+CREATE INDEX idx_pg_background_tasks_queue
+    ON pg_background_tasks(joined_at, id)
     WHERE state IN ('pending', 'retrying');
 
-CREATE INDEX idx_pg_background_tasks_state 
+CREATE INDEX idx_pg_background_tasks_state
     ON pg_background_tasks(state, closed_at DESC);
 
-CREATE INDEX idx_pg_background_tasks_topic 
+CREATE INDEX idx_pg_background_tasks_topic
     ON pg_background_tasks(topic);
 
 -- Enqueue a background task (single overloaded function)
