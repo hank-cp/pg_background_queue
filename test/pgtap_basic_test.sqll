@@ -5,8 +5,7 @@ DROP TABLE IF EXISTS t;
 -- Setup
 CREATE EXTENSION IF NOT EXISTS pg_background;
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SET log_min_messages = NOTICE;
--- ALTER SYSTEM SET log_min_messages = 'info';
+-- ALTER SYSTEM SET log_min_messages = 'debug1';
 -- ALTER SYSTEM RESET logging_collector;
 -- ALTER SYSTEM RESET log_filename;
 -- ALTER SYSTEM RESET log_min_messages;

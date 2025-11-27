@@ -59,7 +59,10 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static int	pg_background_max_parallel_running_tasks_count = 0;
 static int	pg_background_retry_count = 0;
 static int	pg_background_delay_in_sec = 0;
-static int	pg_background_topic_priority = 100;
+static char *pg_background_topic_config = NULL;
+
+/* Cache for JSON configuration */
+static char *cached_topic_config = NULL;
 
 /* Signal handling */
 static volatile sig_atomic_t got_sigterm = false;
@@ -75,6 +78,9 @@ static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
 static void launch_background_worker(void);
 static inline uint32 get_active_workers_count(void);
+static bool topic_config_check_hook(char **newval, void **extra, GucSource source);
+static void topic_config_assign_hook(const char *newval, void *extra);
+static int get_topic_config_from_json(const char *param_name, const char *topic);
 static int get_config_for_topic(const char *param_name, const char *topic, int default_value);
 static void update_task_state_running(int64 task_id);
 static void update_task_state_finished(int64 task_id);
@@ -122,13 +128,16 @@ _PG_init(void)
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("pg_background.topic_priority",
-							"Default priority for topics (lower number = higher priority).",
-							NULL,
-							&pg_background_topic_priority,
-							100, 0, INT_MAX,
-							PGC_SIGHUP, 0,
-							NULL, NULL, NULL);
+	DefineCustomStringVariable("pg_background.topic_config",
+							   "JSON configuration for topic-specific settings (format: {\"topic\": {\"retry_count\": 1, \"delay_in_sec\": 2, \"priority\": 3}})",
+							   NULL,
+							   &pg_background_topic_config,
+							   "",
+							   PGC_SIGHUP,
+							   0,
+							   topic_config_check_hook,
+							   topic_config_assign_hook,
+							   NULL);
 
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = pg_background_shmem_request;
@@ -172,7 +181,9 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 		topic_text = PG_GETARG_TEXT_PP(1);
 		topic = text_to_cstring(topic_text);
 	}
-	priority = get_config_for_topic("priority", topic, pg_background_topic_priority);
+
+	/* Get configuration for this topic */
+	priority = get_config_for_topic("priority", topic, 100);
 
 	/* Step 1: Insert task to pg_background_tasks */
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -459,6 +470,9 @@ pg_background_worker_loop(Datum main_arg)
 
 		elog(DEBUG1, "PG_BACKGROUND_WORKER: retry_count=%d", retry_count);
 
+		/* Get delay config BEFORE finishing SPI */
+		delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
+
 		/* Step 2: Mark task state as running */
 		update_task_state_running(task_id);
 
@@ -466,9 +480,7 @@ pg_background_worker_loop(Datum main_arg)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		/* Step 3: Check delay config by topic & pg_sleep */
-		delay_in_sec = get_config_for_topic("delay_in_sec", topic, pg_background_delay_in_sec);
-
+		/* Step 3: pg_sleep if delay configured */
 		if (delay_in_sec > 0)
 		{
 			elog(DEBUG1, "PG_BACKGROUND_WORKER: sleeping for %d seconds", delay_in_sec);
@@ -693,27 +705,163 @@ pg_background_calibrate_workers_count(PG_FUNCTION_ARGS)
 }
 
 /*
+ * GUC check hook for pg_background.topic_config
+ * Validates JSON format
+ * Note: We cannot use SPI during server startup, so we do basic validation only
+ */
+static bool
+topic_config_check_hook(char **newval, void **extra, GucSource source)
+{
+	char	   *json_str = *newval;
+
+	/* Empty string is valid (means no topic-specific config) */
+	if (json_str == NULL || json_str[0] == '\0')
+		return true;
+
+	/* Basic syntax check: must start with { and end with } */
+	{
+		size_t		len = strlen(json_str);
+		char	   *trimmed = json_str;
+
+		/* Skip leading whitespace */
+		while (*trimmed && (*trimmed == ' ' || *trimmed == '\t' || *trimmed == '\n' || *trimmed == '\r'))
+			trimmed++;
+
+		if (*trimmed != '{')
+		{
+			GUC_check_errdetail("pg_background.topic_config must be a JSON object starting with '{'");
+			return false;
+		}
+
+		/* Check trailing brace */
+		{
+			char *end = json_str + len - 1;
+			while (end > json_str && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+				end--;
+
+			if (*end != '}')
+			{
+				GUC_check_errdetail("pg_background.topic_config must be a JSON object ending with '}'");
+				return false;
+			}
+		}
+	}
+
+	/*
+	 * Full JSON validation will happen when the config is actually used.
+	 * This allows the GUC to be set during server startup when SPI is not available.
+	 */
+
+	return true;
+}
+
+/*
+ * GUC assign hook for pg_background.topic_config
+ * Clears cache when configuration changes
+ */
+static void
+topic_config_assign_hook(const char *newval, void *extra)
+{
+	/* Clear cache when config changes */
+	if (cached_topic_config != NULL)
+	{
+		pfree(cached_topic_config);
+		cached_topic_config = NULL;
+	}
+
+	elog(LOG, "pg_background.topic_config updated, cache cleared");
+}
+
+/*
+ * Get topic-specific config value from JSON configuration.
+ * Returns -1 if not found or on error.
+ */
+static int
+get_topic_config_from_json(const char *param_name, const char *topic)
+{
+	char	   *json_str;
+	int			ret;
+	int			result = -1;
+	StringInfoData query;
+	Oid			argtypes[3];
+	Datum		values[3];
+	bool		isnull;
+
+	if (topic == NULL || topic[0] == '\0')
+		return -1;
+
+	/* If no JSON config or topic is NULL/empty, return -1 */
+	json_str = pg_background_topic_config;
+	if (json_str == NULL || json_str[0] == '\0')
+		return -1;
+
+	/* Parse JSON using SPI */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return -1;
+
+	/*
+	 * Execute SQL:
+	 * SELECT (config->$1->>$2)::int
+	 * FROM (SELECT $3::json AS config) t
+	 * WHERE config->$1 IS NOT NULL AND config->$1->>$2 IS NOT NULL
+	 */
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "SELECT (config->$1->>$2)::int "
+					 "FROM (SELECT $3::json AS config) t "
+					 "WHERE config->$1 IS NOT NULL AND config->$1->>$2 IS NOT NULL");
+
+	argtypes[0] = TEXTOID;	/* topic */
+	argtypes[1] = TEXTOID;	/* param_name */
+	argtypes[2] = TEXTOID;	/* json_str */
+
+	values[0] = CStringGetTextDatum(topic);
+	values[1] = CStringGetTextDatum(param_name);
+	values[2] = CStringGetTextDatum(json_str);
+
+	ret = SPI_execute_with_args(query.data, 3, argtypes, values, NULL, true, 0);
+
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		result = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc,
+											  1, &isnull));
+		if (isnull)
+			result = -1;
+	}
+
+	SPI_finish();
+
+	return result;
+}
+
+/*
  * Get configuration value for a specific topic.
  */
 static int
 get_config_for_topic(const char *param_name, const char *topic, int default_value)
 {
+	int			json_value;
 	char		guc_name[256];
 	const char *guc_value;
 
-	if (topic != NULL && topic[0] != '\0')
+	/* 1. Priority: Get topic-specific config from JSON */
+	json_value = get_topic_config_from_json(param_name, topic);
+
+	if (json_value != -1)
 	{
-		snprintf(guc_name, sizeof(guc_name), "pg_background.%s.%s", param_name, topic);
-		guc_value = GetConfigOption(guc_name, true, false);
-		if (guc_value != NULL)
-			return atoi(guc_value);
+		elog(DEBUG1, "get_config_for_topic: using JSON config for topic '%s', %s = %d",
+			 topic ? topic : "(null)", param_name, json_value);
+		return json_value;
 	}
 
+	/* 2. Fallback to global GUC config */
 	snprintf(guc_name, sizeof(guc_name), "pg_background.%s", param_name);
 	guc_value = GetConfigOption(guc_name, true, false);
 	if (guc_value != NULL)
 		return atoi(guc_value);
 
+	/* 3. Use default value */
 	return default_value;
 }
 
