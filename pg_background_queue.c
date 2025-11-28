@@ -369,17 +369,17 @@ launch_background_worker(void)
 	else
 	{
 		uint32 count;
-		
+
 		elog(DEBUG1, "QUEUE_CONTROL: RegisterDynamicBackgroundWorker succeeded");
 		elog(DEBUG1, "QUEUE_CONTROL: checking pg_background_shmem pointer: %p", pg_background_shmem);
-		
+
 		if (pg_background_shmem == NULL)
 		{
 			elog(ERROR, "QUEUE_CONTROL: shared memory not initialized. "
 				 "Please add 'pg_background_queue' to shared_preload_libraries in postgresql.conf and restart PostgreSQL.");
 			return;
 		}
-		
+
 		elog(DEBUG1, "QUEUE_CONTROL: about to call pg_atomic_fetch_add_u32");
 		count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
 		elog(DEBUG1, "QUEUE_CONTROL: pg_atomic_fetch_add_u32 succeeded, count=%u", count);
@@ -402,28 +402,18 @@ pg_background_queue_worker_loop(Datum main_arg)
 	Oid			database_id;
 	Oid			user_id;
 
-  elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~1");
-
 	// after background worker launched, wait awhile in case massive tasks are enqueued,
 	// worker closed too quick before new tasks batch inserting finished.
 	pg_usleep(1000000L);
 
-	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~2");
-
 	before_shmem_exit(pg_background_worker_cleanup, (Datum) 0);
-
-	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~3");
 
 	pqsignal(SIGTERM, handle_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~4");
-
 	/* Extract database_id and user_id from bgw_extra BEFORE any setup */
 	memcpy(&database_id, MyBgworkerEntry->bgw_extra, sizeof(Oid));
 	memcpy(&user_id, MyBgworkerEntry->bgw_extra + sizeof(Oid), sizeof(Oid));
-
-  elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~5");
 
 	/* Connect to the database - this sets up memory contexts and resource owners */
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
@@ -464,8 +454,8 @@ pg_background_queue_worker_loop(Datum main_arg)
 							   "SELECT id, sql_statement, topic, retry_count "
 							   "FROM pg_background_tasks "
 							   "WHERE state IN ('pending', 'retrying') "
-							   "AND (joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL) <= NOW() "
-							   "ORDER BY priority, joined_at, id LIMIT 1 FOR UPDATE SKIP LOCKED");
+							   "ORDER BY priority, joined_at + (COALESCE(retry_delay_in_sec, 0) || ' seconds')::INTERVAL, id "
+							   "LIMIT 1 FOR UPDATE SKIP LOCKED");
 
 		ret = SPI_execute(query.data, false, 0);
 
