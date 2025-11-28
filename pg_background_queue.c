@@ -1,6 +1,6 @@
 /*--------------------------------------------------------------------------
  *
- * pg_background.c
+ * pg_background_queue.c
  *		Run SQL commands using background workers with queue management.
  *
  * Copyright (C) 2014, PostgreSQL Global Development Group
@@ -42,7 +42,7 @@
 #include "utils/timeout.h"
 #include "postmaster/bgworker.h"
 
-#include "pg_background.h"
+#include "pg_background_queue.h"
 
 PG_MODULE_MAGIC;
 
@@ -69,10 +69,10 @@ static volatile sig_atomic_t got_sigterm = false;
 
 /* Function declarations */
 PG_FUNCTION_INFO_V1(pg_background_enqueue);
-PG_FUNCTION_INFO_V1(pg_background_ensure_workers);
-PG_FUNCTION_INFO_V1(pg_background_active_workers_count);
-PG_FUNCTION_INFO_V1(pg_background_calibrate_workers_count);
-PGDLLEXPORT void pg_background_worker_loop(Datum);
+PG_FUNCTION_INFO_V1(pg_background_queue_ensure_workers);
+PG_FUNCTION_INFO_V1(pg_background_queue_active_workers_count);
+PG_FUNCTION_INFO_V1(pg_background_queue_calibrate_workers_count);
+PGDLLEXPORT void pg_background_queue_worker_loop(Datum);
 
 static void handle_sigterm(SIGNAL_ARGS);
 static void execute_sql_string(const char *sql);
@@ -104,7 +104,7 @@ _PG_init(void)
 	max_worker_processes_value = atoi(guc_value);
 	default_max_parallel = max_worker_processes_value / 2;
 
-	DefineCustomIntVariable("pg_background.max_parallel_running_tasks_count",
+	DefineCustomIntVariable("pg_background_queue.max_parallel_running_tasks_count",
 							"Maximum parallel running tasks (0 = auto).",
 							NULL,
 							&pg_background_max_parallel_running_tasks_count,
@@ -112,7 +112,7 @@ _PG_init(void)
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("pg_background.retry_count",
+	DefineCustomIntVariable("pg_background_queue.retry_count",
 							"Number of retries for failed tasks.",
 							NULL,
 							&pg_background_retry_count,
@@ -120,7 +120,7 @@ _PG_init(void)
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("pg_background.delay_in_sec",
+	DefineCustomIntVariable("pg_background_queue.delay_in_sec",
 							"Delay in seconds before executing each task.",
 							NULL,
 							&pg_background_delay_in_sec,
@@ -128,7 +128,7 @@ _PG_init(void)
 							PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomStringVariable("pg_background.topic_config",
+	DefineCustomStringVariable("pg_background_queue.topic_config",
 							   "JSON configuration for topic-specific settings (format: {\"topic\": {\"retry_count\": 1, \"delay_in_sec\": 2, \"priority\": 3}})",
 							   NULL,
 							   &pg_background_topic_config,
@@ -238,7 +238,7 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
  * It launches a worker if there are pending tasks and worker slots available.
  */
 Datum
-pg_background_ensure_workers(PG_FUNCTION_ARGS)
+pg_background_queue_ensure_workers(PG_FUNCTION_ARGS)
 {
 	uint32		running_count;
 	int			pending_count;
@@ -272,7 +272,7 @@ pg_background_ensure_workers(PG_FUNCTION_ARGS)
 	/* If no pending tasks, nothing to do */
 	if (pending_count == 0)
 	{
-		elog(DEBUG1, "pg_background_ensure_workers: no pending tasks");
+		elog(DEBUG1, "pg_background_queue_ensure_workers: no pending tasks");
 		PG_RETURN_VOID();
 	}
 
@@ -281,13 +281,13 @@ pg_background_ensure_workers(PG_FUNCTION_ARGS)
 
 	if (running_count < pg_background_max_parallel_running_tasks_count)
 	{
-		elog(LOG, "pg_background_ensure_workers: launching worker, pending tasks: %d, running workers: %u/%d",
+		elog(LOG, "pg_background_queue_ensure_workers: launching worker, pending tasks: %d, running workers: %u/%d",
 			 pending_count, running_count, pg_background_max_parallel_running_tasks_count);
 		launch_background_worker();
 	}
 	else
 	{
-		elog(DEBUG1, "pg_background_ensure_workers: max parallel limit reached (%u/%d), pending tasks: %d",
+		elog(DEBUG1, "pg_background_queue_ensure_workers: max parallel limit reached (%u/%d), pending tasks: %d",
 			 running_count, pg_background_max_parallel_running_tasks_count, pending_count);
 	}
 
@@ -298,7 +298,7 @@ pg_background_ensure_workers(PG_FUNCTION_ARGS)
  * Launch background worker loop.
  * Following AGENTS.md flow:
  *   Check max_parallel_running_tasks_count for topic →
- *   If allowed, register worker for pg_background_worker_loop → End
+ *   If allowed, register worker for pg_background_queue_worker_loop → End
  */
 static void
 launch_background_worker(void)
@@ -336,22 +336,24 @@ launch_background_worker(void)
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_background");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_background_worker_loop");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_background worker loop");
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_background_queue");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_background_queue_worker_loop");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_background_queue");
 #if PG_VERSION_NUM >= 110000
-	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_background");
+	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_background_queue");
 #endif
 	worker.bgw_main_arg = (Datum) 0;
 
+
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
+
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &worker_handle))
 	{
 		elog(WARNING, "QUEUE_CONTROL: Bad happened!! cannot register background process. "
 		  "`active_workers_count` is not counted correctly, "
-		  "or maybe `pg_background.max_parallel_running_tasks_count` is larger than `max_worker_processes`."
+		  "or maybe `pg_background_queue.max_parallel_running_tasks_count` is larger than `max_worker_processes`."
 		  "Try increase `max_worker_processes` to fix me.");
 	}
 	else
@@ -370,23 +372,33 @@ launch_background_worker(void)
  *   Repeat until no tasks
  */
 void
-pg_background_worker_loop(Datum main_arg)
+pg_background_queue_worker_loop(Datum main_arg)
 {
 	Oid			database_id;
 	Oid			user_id;
+
+  elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~1");
 
 	// after background worker launched, wait awhile in case massive tasks are enqueued,
 	// worker closed too quick before new tasks batch inserting finished.
 	pg_usleep(1000000L);
 
+	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~2");
+
 	before_shmem_exit(pg_background_worker_cleanup, (Datum) 0);
+
+	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~3");
 
 	pqsignal(SIGTERM, handle_sigterm);
 	BackgroundWorkerUnblockSignals();
 
+	elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~4");
+
 	/* Extract database_id and user_id from bgw_extra BEFORE any setup */
 	memcpy(&database_id, MyBgworkerEntry->bgw_extra, sizeof(Oid));
 	memcpy(&user_id, MyBgworkerEntry->bgw_extra + sizeof(Oid), sizeof(Oid));
+
+  elog(INFO, "~~~~~~~~~~~~~~~~~~~~~~~~~~5");
 
 	/* Connect to the database - this sets up memory contexts and resource owners */
 	BackgroundWorkerInitializeConnectionByOid(database_id, user_id, 0);
@@ -634,7 +646,7 @@ get_active_workers_count(void)
  * SQL-callable function to get current active workers count.
  */
 Datum
-pg_background_active_workers_count(PG_FUNCTION_ARGS)
+pg_background_queue_active_workers_count(PG_FUNCTION_ARGS)
 {
 	uint32		count;
 
@@ -652,7 +664,7 @@ pg_background_active_workers_count(PG_FUNCTION_ARGS)
  * and the actual number of running pg_background workers.
  */
 Datum
-pg_background_calibrate_workers_count(PG_FUNCTION_ARGS)
+pg_background_queue_calibrate_workers_count(PG_FUNCTION_ARGS)
 {
 	int			ret;
 	int			actual_count;
@@ -692,12 +704,12 @@ pg_background_calibrate_workers_count(PG_FUNCTION_ARGS)
 
 	if (old_count != (uint32) actual_count)
 	{
-		elog(LOG, "pg_background_calibrate_workers_count: calibrated counter from %u to %d",
+		elog(LOG, "pg_background_queue_calibrate_workers_count: calibrated counter from %u to %d",
 			 old_count, actual_count);
 	}
 	else
 	{
-		elog(DEBUG1, "pg_background_calibrate_workers_count: counter already accurate at %u",
+		elog(DEBUG1, "pg_background_queue_calibrate_workers_count: counter already accurate at %u",
 			 old_count);
 	}
 
@@ -705,7 +717,7 @@ pg_background_calibrate_workers_count(PG_FUNCTION_ARGS)
 }
 
 /*
- * GUC check hook for pg_background.topic_config
+ * GUC check hook for pg_background_queue.topic_config
  * Validates JSON format
  * Note: We cannot use SPI during server startup, so we do basic validation only
  */
@@ -729,7 +741,7 @@ topic_config_check_hook(char **newval, void **extra, GucSource source)
 
 		if (*trimmed != '{')
 		{
-			GUC_check_errdetail("pg_background.topic_config must be a JSON object starting with '{'");
+			GUC_check_errdetail("pg_background_queue.topic_config must be a JSON object starting with '{'");
 			return false;
 		}
 
@@ -741,7 +753,7 @@ topic_config_check_hook(char **newval, void **extra, GucSource source)
 
 			if (*end != '}')
 			{
-				GUC_check_errdetail("pg_background.topic_config must be a JSON object ending with '}'");
+				GUC_check_errdetail("pg_background_queue.topic_config must be a JSON object ending with '}'");
 				return false;
 			}
 		}
@@ -756,7 +768,7 @@ topic_config_check_hook(char **newval, void **extra, GucSource source)
 }
 
 /*
- * GUC assign hook for pg_background.topic_config
+ * GUC assign hook for pg_background_queue.topic_config
  * Clears cache when configuration changes
  */
 static void
@@ -769,7 +781,7 @@ topic_config_assign_hook(const char *newval, void *extra)
 		cached_topic_config = NULL;
 	}
 
-	elog(LOG, "pg_background.topic_config updated, cache cleared");
+	elog(LOG, "pg_background_queue.topic_config updated, cache cleared");
 }
 
 /*
@@ -856,7 +868,7 @@ get_config_for_topic(const char *param_name, const char *topic, int default_valu
 	}
 
 	/* 2. Fallback to global GUC config */
-	snprintf(guc_name, sizeof(guc_name), "pg_background.%s", param_name);
+	snprintf(guc_name, sizeof(guc_name), "pg_background_queue.%s", param_name);
 	guc_value = GetConfigOption(guc_name, true, false);
 	if (guc_value != NULL)
 		return atoi(guc_value);

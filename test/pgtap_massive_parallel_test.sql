@@ -1,5 +1,5 @@
 -- Clean Up
-DROP EXTENSION IF EXISTS pg_background CASCADE;
+DROP EXTENSION IF EXISTS pg_background_queue CASCADE;
 DROP TABLE IF EXISTS pg_background_tasks CASCADE;
 DROP TRIGGER IF EXISTS t_trigger ON t;
 DROP TABLE IF EXISTS t CASCADE;
@@ -8,7 +8,7 @@ DROP FUNCTION IF EXISTS test_trigger_func CASCADE;
 --TRUNCATE t;
 
 -- Setup
-CREATE EXTENSION IF NOT EXISTS pg_background;
+CREATE EXTENSION IF NOT EXISTS pg_background_queue;
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
 CREATE OR REPLACE FUNCTION test_trigger()
@@ -16,7 +16,7 @@ CREATE OR REPLACE FUNCTION test_trigger()
 BEGIN
   IF NEW.touch IS NULL THEN
     RAISE NOTICE 'Enter tigger %', NEW.id;
-    PERFORM pg_background_enqueue(format('SELECT test_trigger_func(%s)', NEW.id));
+    PERFORM pg_background_queue_enqueue(format('SELECT test_trigger_func(%s)', NEW.id));
     RAISE NOTICE 'Exit tigger %', NEW.id;
   END IF;
   RETURN NEW;
@@ -57,7 +57,7 @@ SELECT lives_ok(
 -- TRUNCATE pg_background_tasks;
 -- SELECT test_trigger_func(1);
 -- SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
--- SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background';
+-- SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background_queue';
 -- SELECT * FROM pg_stat_activity WHERE client_port IS NULL AND usesysid IS NOT NULL;
 
 SELECT pg_sleep(0.2);
@@ -68,7 +68,7 @@ SELECT is(
   'background tasks should be planned');
 
 SELECT is(
-  (SELECT pg_background_active_workers_count()),
+  (SELECT pg_background_queue_active_workers_count()),
   '4',
   '(4 = 8/2) active background worker.'
 );

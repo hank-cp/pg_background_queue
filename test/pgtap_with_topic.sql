@@ -1,18 +1,18 @@
 -- Clean Up
-DROP EXTENSION IF EXISTS pg_background CASCADE;
+DROP EXTENSION IF EXISTS pg_background_queue CASCADE;
 DROP TABLE IF EXISTS t;
 
 -- Setup
-CREATE EXTENSION IF NOT EXISTS pg_background;
+CREATE EXTENSION IF NOT EXISTS pg_background_queue;
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
 -- Clean up test data
 -- TRUNCATE pg_background_tasks;
 
 -- Reset configurations to defaults
-ALTER SYSTEM RESET pg_background.topic_config;
-ALTER SYSTEM RESET pg_background.retry_count;
-ALTER SYSTEM RESET pg_background.delay_in_sec;
+ALTER SYSTEM RESET pg_background_queue.topic_config;
+ALTER SYSTEM RESET pg_background_queue.retry_count;
+ALTER SYSTEM RESET pg_background_queue.delay_in_sec;
 SELECT pg_reload_conf();
 
 SELECT plan(11);
@@ -23,7 +23,7 @@ SELECT plan(11);
 
 -- Test 1: Default topic_config should be empty string
 SELECT is(
-    current_setting('pg_background.topic_config', true),
+    current_setting('pg_background_queue.topic_config', true),
     '',
     'Default topic_config should be empty string'
 );
@@ -33,14 +33,14 @@ SELECT is(
 -- ============================================================================
 
 -- Setup for priority tests
-ALTER SYSTEM SET pg_background.retry_count = 1;
-ALTER SYSTEM SET pg_background.topic_config = '{"high_priority": {"retry_count": 2, "priority": 10}, "partial": {"priority": 50}}';
+ALTER SYSTEM SET pg_background_queue.retry_count = 1;
+ALTER SYSTEM SET pg_background_queue.topic_config = '{"high_priority": {"retry_count": 2, "priority": 10}, "partial": {"priority": 50}}';
 SELECT pg_reload_conf();
 
 CREATE TABLE t(id integer);
 
 -- Test 2: JSON config priority overrides global config
-SELECT pg_background_enqueue('INSERT INTO t SELECT 1', 'high_priority');
+SELECT pg_background_queue_enqueue('INSERT INTO t SELECT 1', 'high_priority');
 SELECT is(
     (SELECT priority FROM pg_background_tasks WHERE topic = 'high_priority' ORDER BY id DESC LIMIT 1),
     10,
@@ -48,7 +48,7 @@ SELECT is(
 );
 
 -- Test 3: Partial config uses JSON for priority
-SELECT pg_background_enqueue('INSERT INTO t SELECT 2', 'partial');
+SELECT pg_background_queue_enqueue('INSERT INTO t SELECT 2', 'partial');
 SELECT is(
     (SELECT priority FROM pg_background_tasks WHERE topic = 'partial' ORDER BY id DESC LIMIT 1),
     50,
@@ -56,7 +56,7 @@ SELECT is(
 );
 
 -- Test 4: Unconfigured topic uses global config
-SELECT pg_background_enqueue('INSERT INTO t SELECT 3', 'unconfigured');
+SELECT pg_background_queue_enqueue('INSERT INTO t SELECT 3', 'unconfigured');
 SELECT is(
     (SELECT priority FROM pg_background_tasks WHERE topic = 'unconfigured' ORDER BY id DESC LIMIT 1),
     100,
@@ -64,7 +64,7 @@ SELECT is(
 );
 
 -- Test 5: NULL topic uses global config
-SELECT pg_background_enqueue('INSERT INTO t SELECT 4');
+SELECT pg_background_queue_enqueue('INSERT INTO t SELECT 4');
 SELECT is(
     (SELECT priority FROM pg_background_tasks WHERE topic IS NULL ORDER BY id DESC LIMIT 1),
     100,
@@ -78,9 +78,9 @@ SELECT * FROM pg_background_tasks ORDER BY id;
 -- ============================================================================
 
 -- Test 6: JSON config topic
-SELECT pg_background_enqueue('INSERT INTO tt SELECT 1', 'high_priority');
-SELECT pg_background_enqueue('INSERT INTO ttt SELECT 2', 'unconfigured');
-SELECT pg_background_enqueue('INSERT INTO ttt SELECT 2');
+SELECT pg_background_queue_enqueue('INSERT INTO tt SELECT 1', 'high_priority');
+SELECT pg_background_queue_enqueue('INSERT INTO ttt SELECT 2', 'unconfigured');
+SELECT pg_background_queue_enqueue('INSERT INTO ttt SELECT 2');
 SELECT pg_sleep(10);
 
 SELECT is(
@@ -122,9 +122,9 @@ SELECT is(
 -- Cleanup
 -- ============================================================================
 
-ALTER SYSTEM RESET pg_background.topic_config;
-ALTER SYSTEM RESET pg_background.retry_count;
-ALTER SYSTEM RESET pg_background.delay_in_sec;
+ALTER SYSTEM RESET pg_background_queue.topic_config;
+ALTER SYSTEM RESET pg_background_queue.retry_count;
+ALTER SYSTEM RESET pg_background_queue.delay_in_sec;
 SELECT pg_reload_conf();
 
 SELECT * FROM finish();

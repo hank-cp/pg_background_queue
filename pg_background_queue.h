@@ -1,5 +1,5 @@
-#ifndef PG_BACKGROUND_H_
-#define PG_BACKGROUND_H_
+#ifndef PG_BACKGROUND_QUEUE_H_
+#define PG_BACKGROUND_QUEUE_H_
 
 /* Various macros for backward compatbility */
 
@@ -49,4 +49,4 @@
 #define EndCommand_compat(qc, dest, force) EndCommand((qc), (dest))
 #endif
 
-#endif			/* PG_BACKGROUND_H_ */
+#endif			/* PG_BACKGROUND_QUEUE_H_ */
