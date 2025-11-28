@@ -41,7 +41,8 @@ This extension is ideal for:
 
 ```bash
 # Clone the repository
-cd /path/to/pg_background_queue
+git clone https://github.com/hank-cp/pg_background_queue.git
+cd pg_background_queue
 
 # Build the extension
 make clean && make
@@ -64,13 +65,7 @@ shared_preload_libraries = 'pg_background_queue'  # Add to existing list if any
 max_worker_processes = 16  # Ensure enough workers for your workload
 ```
 
-Find your `postgresql.conf` location:
-
-```sql
-SHOW config_file;
-```
-
-After modifying the configuration, restart PostgreSQL:
+❗️️After modifying the configuration, restart PostgreSQL:
 
 ```bash
 pg_ctl restart
@@ -131,10 +126,10 @@ Tasks with lower priority values are executed first.
 -- Check active worker count
 SELECT pg_background_queue_active_workers_count();
 
--- Ensure workers are running (manually trigger)
+-- Ensure workers are running (❗️️SUGGESTING: trigger by pg_cron)
 SELECT pg_background_queue_ensure_workers();
 
--- Calibrate worker count (sync with actual processes)
+-- Calibrate worker count (❗️️SUGGESTING: trigger by pg_cron)
 SELECT pg_background_queue_calibrate_workers_count();
 ```
 
@@ -183,9 +178,9 @@ pg_background_queue.topic_config = '{
 
 **Configuration Parameters:**
 
-- `max_parallel_running_tasks_count`: Maximum concurrent tasks for this topic (default: global setting)
+- `max_parallel_running_tasks_count`: Maximum concurrent tasks for this topic (default: half of `max_worker_processes`)
 - `retry_count`: Number of retry attempts for failed tasks (default: global setting)
-- `delay_in_sec`: Delay in seconds before executing each task (default: global setting)
+- `delay_in_sec`: Delay in seconds before executing each task to reduce RPM (default: global setting)
 - `priority`: Default priority for tasks in this topic (lower = higher priority, default: 100)
 
 **Apply Configuration:**

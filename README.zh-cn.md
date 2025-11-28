@@ -5,7 +5,7 @@
 
 # pg_background_queue
 
-一个 PostgreSQL 扩展,提供具有高级并发控制、自动重试和基于主题配置的强大后台任务队列系统。
+一个 PostgreSQL 扩展,提供具有高级并发控制、自动重试和基于topic配置的强大后台任务队列系统。
 
 ## 简介
 
@@ -16,7 +16,7 @@
 - **作业调度**:队列维护任务、数据处理或 ETL 操作
 - **速率限制**:通过可配置的延迟控制任务执行速率
 - **容错能力**:对失败的任务进行指数退避的自动重试
-- **多租户**:针对不同工作负载类型的基于主题的配置
+- **多租户**:针对不同工作负载类型的基于topic的配置
 
 ## 核心特性
 
@@ -24,7 +24,7 @@
 - **✅ 自动工作进程管理**:具有内置并发限制的动态后台工作进程分配
 - **✅ 优先级支持**:优先执行高优先级任务
 - **✅ 重试机制**:可配置的自动重试,支持指数退避
-- **✅ 基于主题的配置**:针对并发、延迟和重试策略的每个主题设置
+- **✅ 基于topic的配置**:针对并发、延迟和重试策略的每个topic设置
 - **✅ 速率限制**:配置任务执行之间的延迟以防止系统过载
 - **✅ 健康监控**:跟踪任务状态(待处理、运行中、重试中、失败、已完成)
 - **✅ pg_cron 集成**:可选调度以增强稳定性和自动工作进程恢复
@@ -64,12 +64,6 @@ shared_preload_libraries = 'pg_background_queue'  # 如果已有其他扩展,添
 max_worker_processes = 16  # 确保有足够的工作进程满足您的工作负载
 ```
 
-查找 `postgresql.conf` 位置:
-
-```sql
-SHOW config_file;
-```
-
 修改配置后,重启 PostgreSQL:
 
 ```bash
@@ -94,7 +88,7 @@ SELECT * FROM pg_extension WHERE extname = 'pg_background_queue';
 -- 入队一个简单任务
 SELECT pg_background_enqueue('SELECT pg_sleep(5)');
 
--- 入队一个带主题的任务
+-- 入队一个带topic的任务
 SELECT pg_background_enqueue(
     'INSERT INTO logs (message) VALUES (''Background task completed'')',
     'logging'
@@ -131,10 +125,10 @@ SELECT pg_background_enqueue('SELECT cleanup_old_data()', 'maintenance');
 -- 检查活跃工作进程数
 SELECT pg_background_queue_active_workers_count();
 
--- 确保工作进程正在运行(手动触发)
+-- 确保工作进程正在运行(❗强烈建议配置pg_cron来触发)
 SELECT pg_background_queue_ensure_workers();
 
--- 校准工作进程数(与实际进程同步)
+-- 校准工作进程数(❗强烈建议配置pg_cron来触发)
 SELECT pg_background_queue_calibrate_workers_count();
 ```
 
@@ -153,9 +147,9 @@ pg_background_queue.retry_count = 3
 pg_background_queue.delay_in_sec = 1
 ```
 
-### 基于主题的配置
+### 基于topic的配置
 
-使用 JSON 配置覆盖特定主题的全局设置:
+使用 JSON 配置覆盖特定topic的全局设置:
 
 ```bash
 # 在 postgresql.conf 中
@@ -183,10 +177,10 @@ pg_background_queue.topic_config = '{
 
 **配置参数:**
 
-- `max_parallel_running_tasks_count`: 该主题的最大并发任务数(默认:全局设置)
+- `max_parallel_running_tasks_count`: 该topic的最大并发任务数(默认:全局设置)
 - `retry_count`: 失败任务的重试次数(默认:全局设置)
-- `delay_in_sec`: 执行每个任务前的延迟秒数(默认:全局设置)
-- `priority`: 该主题任务的默认优先级(越小优先级越高,默认: 100)
+- `delay_in_sec`: 执行每个任务前的延迟秒数, 用于降低请求频率(默认:全局设置)
+- `priority`: 该topic任务的默认优先级(越小优先级越高,默认: 100)
 
 **应用配置:**
 
@@ -255,7 +249,7 @@ SELECT cron.unschedule('pg_background_queue_calibrate');
 
 **参数:**
 - `sql`: 要执行的 SQL 语句
-- `topic`: 可选的主题,用于主题特定配置
+- `topic`: 可选的topic,用于topic特定配置
 
 **返回值:** 任务 ID (bigint)
 
@@ -306,7 +300,7 @@ SELECT pg_background_queue_calibrate_workers_count();
 **列:**
 - `id` (bigserial): 唯一任务标识符
 - `sql_statement` (text): 要执行的 SQL 命令
-- `topic` (text): 可选的主题用于配置
+- `topic` (text): 可选的topic用于配置
 - `joined_at` (timestamp): 任务入队时间
 - `started_at` (timestamp): 任务执行开始时间
 - `closed_at` (timestamp): 任务完成时间(成功或失败)
@@ -341,7 +335,7 @@ WHERE state = 'failed'
 ORDER BY closed_at DESC
 LIMIT 10;
 
--- 按主题统计平均任务持续时间
+-- 按topic统计平均任务持续时间
 SELECT 
     topic,
     COUNT(*) as total_tasks,
