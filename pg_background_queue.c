@@ -185,7 +185,7 @@ pg_background_enqueue(PG_FUNCTION_ARGS)
 	/* Get configuration for this topic */
 	priority = get_config_for_topic("priority", topic, 100);
 
-	/* Step 1: Insert task to pg_background_tasks */
+	/* Step 1: Insert task to pg_background_queue_tasks */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -305,12 +305,16 @@ launch_background_worker(void)
 {
 	uint32		running_count;
 	BackgroundWorker worker;
-	BackgroundWorkerHandle *worker_handle;
 	Oid			db_oid;
 	Oid			user_oid;
 
+	elog(DEBUG1, "QUEUE_CONTROL: launch_background_worker() started");
+
 	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(WARNING, "QUEUE_CONTROL: SPI_connect failed");
 		return;
+	}
 
 	running_count = get_active_workers_count();
 
@@ -329,13 +333,18 @@ launch_background_worker(void)
 
 	SPI_finish();
 
+	elog(DEBUG1, "QUEUE_CONTROL: about to get db_oid and user_oid");
+
 	db_oid = MyDatabaseId;
 	user_oid = GetUserId();
+
+	elog(DEBUG1, "QUEUE_CONTROL: db_oid=%u, user_oid=%u", db_oid, user_oid);
 
 	memset(&worker, 0, sizeof(BackgroundWorker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_notify_pid = 0;  /* Don't wait for worker to start */
 	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_background_queue");
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_background_queue_worker_loop");
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_background_queue");
@@ -348,8 +357,9 @@ launch_background_worker(void)
 	memcpy(&worker.bgw_extra[0], &db_oid, sizeof(Oid));
 	memcpy(&worker.bgw_extra[sizeof(Oid)], &user_oid, sizeof(Oid));
 
+	elog(DEBUG1, "QUEUE_CONTROL: about to call RegisterDynamicBackgroundWorker");
 
-	if (!RegisterDynamicBackgroundWorker(&worker, &worker_handle))
+	if (!RegisterDynamicBackgroundWorker(&worker, NULL))
 	{
 		elog(WARNING, "QUEUE_CONTROL: Bad happened!! cannot register background process. "
 		  "`active_workers_count` is not counted correctly, "
@@ -358,10 +368,25 @@ launch_background_worker(void)
 	}
 	else
 	{
-	  uint32 count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
+		uint32 count;
+		
+		elog(DEBUG1, "QUEUE_CONTROL: RegisterDynamicBackgroundWorker succeeded");
+		elog(DEBUG1, "QUEUE_CONTROL: checking pg_background_shmem pointer: %p", pg_background_shmem);
+		
+		if (pg_background_shmem == NULL)
+		{
+			elog(ERROR, "QUEUE_CONTROL: shared memory not initialized. "
+				 "Please add 'pg_background_queue' to shared_preload_libraries in postgresql.conf and restart PostgreSQL.");
+			return;
+		}
+		
+		elog(DEBUG1, "QUEUE_CONTROL: about to call pg_atomic_fetch_add_u32");
+		count = pg_atomic_fetch_add_u32(&pg_background_shmem->active_workers_count, 1);
+		elog(DEBUG1, "QUEUE_CONTROL: pg_atomic_fetch_add_u32 succeeded, count=%u", count);
 		elog(INFO, "QUEUE_CONTROL: worker registered successfully, active count: %u", count + 1);
-		pfree(worker_handle);
 	}
+
+	elog(DEBUG1, "QUEUE_CONTROL: launch_background_worker() finished");
 }
 
 /*
@@ -609,7 +634,7 @@ pg_background_shmem_startup(void)
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
-	pg_background_shmem = ShmemInitStruct("pg_background",
+	pg_background_shmem = ShmemInitStruct("pg_background_queue",
 										  sizeof(PgBackgroundShmemStruct),
 										  &found);
 
@@ -678,7 +703,7 @@ pg_background_queue_calibrate_workers_count(PG_FUNCTION_ARGS)
 				 errmsg("could not connect to SPI manager")));
 
 	ret = SPI_execute("SELECT COUNT(*) FROM pg_stat_activity "
-					  "WHERE backend_type = 'pg_background'",
+					  "WHERE backend_type = 'pg_background_queue'",
 					  true, 0);
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -1050,7 +1075,7 @@ execute_sql_string(const char *sql)
 		if (IsA(parsetree, TransactionStmt))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("transaction control statements are not allowed in pg_background")));
+					 errmsg("transaction control statements are not allowed in pg_background_queue")));
 
 		commandTag = CreateCommandTag_compat(parsetree);
 		set_ps_display_compat(GetCommandTagName(commandTag));
@@ -1073,7 +1098,7 @@ execute_sql_string(const char *sql)
 #endif
 										NULL);
 
-		portal = CreatePortal("pg_background", true, true);
+		portal = CreatePortal("pg_background_queue", true, true);
 		PortalDefineQuery(portal, NULL, sql, commandTag, plantree_list, NULL);
 		PortalStart(portal, NULL, 0, InvalidSnapshot);
 

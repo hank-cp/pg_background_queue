@@ -8,6 +8,7 @@ USER="postgres"
 PASSWORD=""
 CLEANUP="true"
 TEST_NAME="pg_background_queue"
+TEST_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -31,9 +32,13 @@ while [[ $# -gt 0 ]]; do
             CLEANUP="false"
             shift
             ;;
+        --file)
+            TEST_FILE="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--no-cleanup]"
+            echo "Usage: $0 [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [--no-cleanup] [--file TEST_FILE]"
             exit 1
             ;;
     esac
@@ -103,10 +108,24 @@ echo ""
 echo "=== Running tests ==="
 
 FAILED=0
-for TEST_FILE in "$(dirname "$0")"/pgtap_*.sql; do
-    if [ -f "$TEST_FILE" ]; then
-        echo "Running $(basename "$TEST_FILE")..."
-        TEST_OUTPUT=$($PSQL_CMD -d $TEST_DB -f "$TEST_FILE" 2>&1)
+
+# Determine which test files to run
+if [ -n "$TEST_FILE" ]; then
+    # Single file specified
+    if [ ! -f "$TEST_FILE" ]; then
+        echo "Error: Test file not found: $TEST_FILE"
+        exit 1
+    fi
+    TEST_FILES=("$TEST_FILE")
+else
+    # Run all pgtap_*.sql files
+    TEST_FILES=("$(dirname "$0")"/pgtap_*.sql)
+fi
+
+for TEST_FILE_PATH in "${TEST_FILES[@]}"; do
+    if [ -f "$TEST_FILE_PATH" ]; then
+        echo "Running $(basename "$TEST_FILE_PATH")..."
+        TEST_OUTPUT=$($PSQL_CMD -d $TEST_DB -f "$TEST_FILE_PATH" 2>&1)
         TEST_EXIT_CODE=$?
 
         echo "$TEST_OUTPUT"

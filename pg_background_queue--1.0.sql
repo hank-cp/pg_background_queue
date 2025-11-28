@@ -3,7 +3,7 @@
 \echo Use "CREATE EXTENSION pg_background_queue" to load this file. \quit
 
 -- Create the task state enum type
-CREATE TYPE pg_background_task_state AS ENUM (
+CREATE TYPE pg_background_queue_task_state AS ENUM (
     'pending',
     'running',
     'retrying',
@@ -20,7 +20,7 @@ CREATE TABLE pg_background_tasks (
     started_at TIMESTAMP,
     closed_at TIMESTAMP,
     priority INTEGER NOT NULL DEFAULT 0,
-    state pg_background_task_state NOT NULL DEFAULT 'pending',
+    state pg_background_queue_task_state NOT NULL DEFAULT 'pending',
     retry_count INTEGER NOT NULL DEFAULT 0,
     retry_delay_in_sec INTEGER NOT NULL DEFAULT 0,
     errors TEXT

@@ -22,7 +22,7 @@ SELECT has_column('pg_background_tasks', 'sql_statement', 'sql_statement column 
 SELECT has_column('pg_background_tasks', 'state', 'state column should exist');
 SELECT has_column('pg_background_tasks', 'topic', 'topic column should exist');
 SELECT has_column('pg_background_tasks', 'retry_count', 'retry_count column should exist');
-SELECT has_function('pg_background_enqueue', ARRAY['text', 'text'], 'pg_background_queue_enqueue function should exist');
+SELECT has_function('pg_background_enqueue', ARRAY['text', 'text'], 'pg_background_enqueue function should exist');
 SELECT has_function('pg_background_queue_ensure_workers', 'pg_background_queue_ensure_workers function should exist');
 SELECT has_function('pg_background_queue_active_workers_count', 'pg_background_queue_active_workers_count function should exist');
 SELECT has_function('pg_background_queue_calibrate_workers_count', 'pg_background_queue_calibrate_workers_count function should exist');
@@ -35,7 +35,7 @@ SELECT lives_ok(
        );
 
 -- DEBUG QUERIES
--- SELECT pg_background_queue_enqueue('SELECT pg_sleep(60)');
+-- SELECT pg_background_enqueue('SELECT pg_sleep(60)');
 -- SELECT * FROM pg_background_tasks ORDER BY id;
 -- TRUNCATE pg_background_tasks;
 -- SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_background_queue';

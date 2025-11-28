@@ -48,8 +48,31 @@ make clean && make
 
 # 安装到 PostgreSQL
 make install
+```
 
-# 重启 PostgreSQL 以加载扩展
+### 配置共享预加载库
+
+**重要提示**:此扩展需要共享内存,必须在服务器启动时加载。
+
+编辑您的 `postgresql.conf` 文件:
+
+```bash
+# 将 pg_background_queue 添加到 shared_preload_libraries
+shared_preload_libraries = 'pg_background_queue'  # 如果已有其他扩展,添加到列表中
+
+# 可选:配置工作进程限制
+max_worker_processes = 16  # 确保有足够的工作进程满足您的工作负载
+```
+
+查找 `postgresql.conf` 位置:
+
+```sql
+SHOW config_file;
+```
+
+修改配置后,重启 PostgreSQL:
+
+```bash
 pg_ctl restart
 ```
 
@@ -69,10 +92,10 @@ SELECT * FROM pg_extension WHERE extname = 'pg_background_queue';
 
 ```sql
 -- 入队一个简单任务
-SELECT pg_background_queue_enqueue('SELECT pg_sleep(5)');
+SELECT pg_background_enqueue('SELECT pg_sleep(5)');
 
 -- 入队一个带主题的任务
-SELECT pg_background_queue_enqueue(
+SELECT pg_background_enqueue(
     'INSERT INTO logs (message) VALUES (''Background task completed'')',
     'logging'
 );
@@ -94,10 +117,10 @@ SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
 
 ```sql
 -- 高优先级任务(数字越小优先级越高)
-SELECT pg_background_queue_enqueue('SELECT critical_operation()', 'critical');
+SELECT pg_background_enqueue('SELECT critical_operation()', 'critical');
 
 -- 低优先级任务
-SELECT pg_background_queue_enqueue('SELECT cleanup_old_data()', 'maintenance');
+SELECT pg_background_enqueue('SELECT cleanup_old_data()', 'maintenance');
 ```
 
 优先级值较低的任务会优先执行。
@@ -226,7 +249,7 @@ SELECT cron.unschedule('pg_background_queue_calibrate');
 
 ### 函数
 
-#### `pg_background_queue_enqueue(sql text, topic text DEFAULT NULL)`
+#### `pg_background_enqueue(sql text, topic text DEFAULT NULL)`
 
 入队一个后台执行任务。
 
@@ -238,7 +261,7 @@ SELECT cron.unschedule('pg_background_queue_calibrate');
 
 **示例:**
 ```sql
-SELECT pg_background_queue_enqueue('VACUUM ANALYZE users', 'maintenance');
+SELECT pg_background_enqueue('VACUUM ANALYZE users', 'maintenance');
 ```
 
 #### `pg_background_queue_ensure_workers()`

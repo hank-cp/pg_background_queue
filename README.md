@@ -48,8 +48,31 @@ make clean && make
 
 # Install to PostgreSQL
 make install
+```
 
-# Restart PostgreSQL to load the extension
+### Configure Shared Preload Libraries
+
+**IMPORTANT**: This extension requires shared memory and must be loaded at server start.
+
+Edit your `postgresql.conf` file:
+
+```bash
+# Add pg_background_queue to shared_preload_libraries
+shared_preload_libraries = 'pg_background_queue'  # Add to existing list if any
+
+# Optionally configure worker limits
+max_worker_processes = 16  # Ensure enough workers for your workload
+```
+
+Find your `postgresql.conf` location:
+
+```sql
+SHOW config_file;
+```
+
+After modifying the configuration, restart PostgreSQL:
+
+```bash
 pg_ctl restart
 ```
 
@@ -69,10 +92,10 @@ SELECT * FROM pg_extension WHERE extname = 'pg_background_queue';
 
 ```sql
 -- Enqueue a simple task
-SELECT pg_background_queue_enqueue('SELECT pg_sleep(5)');
+SELECT pg_background_enqueue('SELECT pg_sleep(5)');
 
 -- Enqueue a task with a topic
-SELECT pg_background_queue_enqueue(
+SELECT pg_background_enqueue(
     'INSERT INTO logs (message) VALUES (''Background task completed'')',
     'logging'
 );
@@ -94,10 +117,10 @@ SELECT COUNT(*) FROM pg_background_tasks WHERE state = 'running';
 
 ```sql
 -- High priority task (lower number = higher priority)
-SELECT pg_background_queue_enqueue('SELECT critical_operation()', 'critical');
+SELECT pg_background_enqueue('SELECT critical_operation()', 'critical');
 
 -- Low priority task
-SELECT pg_background_queue_enqueue('SELECT cleanup_old_data()', 'maintenance');
+SELECT pg_background_enqueue('SELECT cleanup_old_data()', 'maintenance');
 ```
 
 Tasks with lower priority values are executed first.
@@ -226,7 +249,7 @@ SELECT cron.unschedule('pg_background_queue_calibrate');
 
 ### Functions
 
-#### `pg_background_queue_enqueue(sql text, topic text DEFAULT NULL)`
+#### `pg_background_enqueue(sql text, topic text DEFAULT NULL)`
 
 Enqueue a task for background execution.
 
@@ -238,7 +261,7 @@ Enqueue a task for background execution.
 
 **Example:**
 ```sql
-SELECT pg_background_queue_enqueue('VACUUM ANALYZE users', 'maintenance');
+SELECT pg_background_enqueue('VACUUM ANALYZE users', 'maintenance');
 ```
 
 #### `pg_background_queue_ensure_workers()`
